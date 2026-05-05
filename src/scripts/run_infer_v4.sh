@@ -26,7 +26,7 @@ FT_HIGH_MODEL_DIR="/home/nvme02/wlx/Memory/outputs/train/v4_stage1_dual/high_noi
 
 # 推理参数
 FRAME_NUM=81             # 单 clip 帧数（81 帧 @ 16fps ≈ 5 秒）
-NUM_CLIPS=12             # v4 默认 12 clip 连续推理
+NUM_CLIPS=5             # v4 默认 12 clip 连续推理
                          # 确保 ACTION_PATH 内 action.npy 帧数 >= FRAME_NUM * NUM_CLIPS
 SAMPLE_STEPS=40
 SAMPLE_SHIFT=10.0
