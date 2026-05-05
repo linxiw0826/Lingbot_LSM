@@ -46,6 +46,7 @@ HYBRID_LONG_K=2          # 混合检索预算中 Long 层 top-K
 DUP_THRESHOLD=0.95       # cross-tier dedup 阈值
 
 VISUAL_FUSION_ALPHA=0.7    # v4 Visual Feature Fusion pose 权重（Innovation 9，default=0.7）
+USE_MEMORY=true            # 启用 ThreeTierMemoryBank（false 跑 baseline 对比）
 
 OUTPUT_BASE="/home/nvme02/wlx/Memory/outputs"   # 推理结果根目录
 CUDA_VISIBLE_DEVICES="1,2,3,4,5"               # 5 卡 Ulysses SP（40 heads ÷ 5 = 8）
@@ -60,7 +61,7 @@ export CUDA_VISIBLE_DEVICES
 NUM_GPUS=$(echo "${CUDA_VISIBLE_DEVICES}" | tr ',' '\n' | grep -c .)
 
 # Wan14B 固定 40 个 attention heads；Ulysses SP 要求 num_heads % GPU数 == 0
-# v4 始终启用 Memory（无 --use_memory 开关），故多卡时始终需要整除检查（对比 run_infer_v3.sh 需额外判断 USE_MEMORY=true）
+# memory 模式下多卡需要整除检查（baseline 模式单卡亦可跑）
 if [ "${NUM_GPUS}" -gt 1 ]; then
     if [ $((40 % NUM_GPUS)) -ne 0 ]; then
         echo "[ERROR] Ulysses SP：${NUM_GPUS} 个 GPU 不能整除 Wan14B 的 40 个 attention heads（余数 $((40 % NUM_GPUS))）。" >&2
@@ -124,7 +125,7 @@ mkdir -p "$(dirname "${SAVE_FILE}")"
 echo "====================================================="
 echo "  LingBot-World Memory Enhancement 推理 v4 启动"
 echo "  Innovations 9+10（visual fusion + tier embedding）"
-echo "  NUM_CLIPS: ${NUM_CLIPS} | NUM_GPUS: ${NUM_GPUS}"
+echo "  NUM_CLIPS: ${NUM_CLIPS} | NUM_GPUS: ${NUM_GPUS} | USE_MEMORY: ${USE_MEMORY}"
 echo "  EXP_NAME   : ${EXP_NAME}"
 echo "  CLIP_NAME  : ${CLIP_NAME}"
 echo "  CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
@@ -163,6 +164,11 @@ CMD=(
     --dup_threshold      "${DUP_THRESHOLD}"
     --visual_fusion_alpha "${VISUAL_FUSION_ALPHA}"
 )
+
+# 可选：use_memory 开关
+if [ "${USE_MEMORY}" = "true" ]; then
+    CMD+=(--use_memory)
+fi
 
 # 可选：LoRA 权重
 if [ -n "${LORA_PATH}" ]; then
