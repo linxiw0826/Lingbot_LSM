@@ -13,7 +13,7 @@ set -euo pipefail
 
 CKPT_DIR="/home/nvme02/lingbot-world/models/lingbot-world-base-act"   # 基础模型目录（必填）
 IMAGE="/home/nvme02/Memory-world/inference_data/revisit_ep027_manual_v2_5clip_selected/Ep000027_p0001_75s_87s_lookback_path/image.jpg"          # 每次推理前填写：<clip目录>/image.jpg
-ACTION_PATH=/home/nvme02/Memory-world/inference_data/revisit_ep027_manual_v2_5clip_selected/Ep000027_p0001_75s_87s_lookback_path"    # 每次推理前填写：<clip目录>
+ACTION_PATH="/home/nvme02/Memory-world/inference_data/revisit_ep027_manual_v2_5clip_selected/Ep000027_p0001_75s_87s_lookback_path"    # 每次推理前填写：<clip目录>
 PROMPT="First-person CS:GO competitive gameplay"
 
 # 微调权重（三选一，留空则跑 baseline）
