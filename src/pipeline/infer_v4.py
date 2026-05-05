@@ -102,6 +102,12 @@ def _sp_dit_forward_with_memory(self, x, t, context, seq_len, y=None, dit_cond_d
             dit_cond_dict[_TIER_IDS_KEY] = _tier_ids_sp.to(_dev)
 
     # ---- Step 2: sp_dit_forward 逻辑（与原版完全一致）----
+    # Ulysses SP 对齐保护：seq_len 必须是 world_size 的整数倍，否则 chunk 不均匀
+    # 导致 rope_apply pad_freqs 收到负 pad_size（见 bug 2026-05-06）
+    _ws = get_world_size()
+    if _ws > 1 and seq_len % _ws != 0:
+        seq_len = (_ws - seq_len % _ws) + seq_len
+
     if self.model_type == 'i2v':
         assert y is not None
     device = self.patch_embedding.weight.device
