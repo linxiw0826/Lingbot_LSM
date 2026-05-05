@@ -796,7 +796,7 @@ def _update_memory_bank_v4(bank, video, pipeline, device, clip_start_frame: int,
                     pose_emb.to(device),
                     visual_emb=visual_embs[t].to(device) if visual_embs is not None else None,
                     alpha=alpha,
-                )  # [5120]，已 detach（get_semantic_key 内部 .detach()）
+                ).cpu()  # [5120]，CPU，已 detach（get_semantic_key 内部 .detach()）
 
         # Innovation 8: 仅更新 Medium + Long（与 train_v4_stage1_dual.py:1226-1227 对称）
         _frame = MemoryFrame(
