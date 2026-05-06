@@ -12,8 +12,8 @@ set -euo pipefail
 #   - 新增 VISUAL_FUSION_ALPHA（Visual Feature Fusion，Innovation 9）
 
 CKPT_DIR="/home/nvme02/lingbot-world/models/lingbot-world-base-act"   # 基础模型目录（必填）
-IMAGE="/home/nvme02/Memory-world/inference_data/revisit_ep027_manual_v2_5clip_selected/Ep000027_p0007_26s_35s_fwd_back_two_windows/image.jpg"          # 每次推理前填写：<clip目录>/image.jpg
-ACTION_PATH="/home/nvme02/Memory-world/inference_data/revisit_ep027_manual_v2_5clip_selected/Ep000027_p0007_26s_35s_fwd_back_two_windows"    # 每次推理前填写：<clip目录>
+IMAGE="/home/nvme02/Memory-world/inference_data/revisit_ep027_manual_v2_5clip_selected/Ep000027_p0007_77s_86s_two_windows_revisit/image.jpg"          # 每次推理前填写：<clip目录>/image.jpg
+ACTION_PATH="/home/nvme02/Memory-world/inference_data/revisit_ep027_manual_v2_5clip_selected/Ep000027_p0007_77s_86s_two_windows_revisit"    # 每次推理前填写：<clip目录>
 PROMPT="First-person CS:GO competitive gameplay"
 
 # 微调权重（三选一，留空则跑 baseline）
