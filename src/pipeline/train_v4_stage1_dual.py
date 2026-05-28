@@ -658,6 +658,12 @@ def enable_gradient_checkpointing(model: nn.Module) -> int:
                     finally:
                         _in_ckpt[0] = False
 
+                # Exp0 fix (OP-1 / F-12 / D-05): activate block input grad for reentrant checkpoint.
+                # With Stage1 frozen backbone, block inputs lose requires_grad; reentrant ckpt then
+                # builds no backward graph, starving memory_cross_attn / gate of gradients.
+                if torch.is_grad_enabled() and not x.requires_grad:
+                    x = x.requires_grad_(True)
+
                 # use_reentrant=True: avoids check_recomputed_tensors_match which fails with ZeRO-3 in-place param release
                 return torch_checkpoint(
                     _run_via_module, x, e, seq_lens, grid_sizes, freqs,
