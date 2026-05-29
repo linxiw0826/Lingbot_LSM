@@ -29,6 +29,13 @@
   三列；`clip_path` 用于定位 `poses.npy` 与 `video.mp4`。若数据集 CSV
   schema 变化（如 clip_path 被改名），需同步更新 load_clip_metas()。
 
+坐标单位假设
+------------
+本脚本不强制单位为米。v4/CSGO 数据集的 pose xyz 单位是 game units
+（≈ inches，1m ≈ 40 units）。所有 --distance_eps /
+--require_intermediate_separation 参数以"数据集原生单位"为准；如改用不同
+坐标系（如真米），请相应调整阈值。BEV 图轴标签也使用 "units" 而非 "m"。
+
 输出文件结构
 ------------
   output_dir/
@@ -143,6 +150,7 @@ class EpisodeStats:
     n_camera_swing: int = 0
     n_same_loc_diff_view: int = 0
     n_grey_zone: int = 0   # 灰色地带：同地点同朝向，但 time_short <= dt <= time_long
+    n_stationary_view_change: int = 0  # 原地静止 + yaw 变化（dist 近 + 未通过中间分离）
     pairs: List[RevisitPair] = field(default_factory=list)
     bev_path: Optional[str] = None     # 相对 output_dir 的路径
     warnings: List[str] = field(default_factory=list)
@@ -413,6 +421,28 @@ def _sample_frame_indices(total_frames: int, max_pairs_dim: int = 500) -> np.nda
     return np.arange(0, total_frames, step, dtype=np.int64)
 
 
+def _compute_max_intermediate_separation(
+    full_xz: np.ndarray,
+    i_a: int,
+    i_b: int,
+) -> float:
+    """对一对端点 (i_a, i_b)（全局帧号 i_a < i_b），扫描原始全部帧 [i_a+1, i_b-1]，
+    计算 max_{k ∈ (i_a, i_b)} max(dist(k, i_a), dist(k, i_b))。
+
+    用于判断 agent 是否真的"离开过"端点附近。原地静止 + yaw 来回的场景下，
+    所有中间帧都靠近 i_a 与 i_b，本值会很小；真的绕一圈再回来则本值很大。
+
+    使用原始全部帧（非稀疏采样）以避免漏掉 agent 离开的中间帧。
+    """
+    if i_b - i_a <= 1:
+        return 0.0
+    seg = full_xz[i_a + 1:i_b]                     # [m, 2]
+    d_a = np.linalg.norm(seg - full_xz[i_a], axis=1)   # [m]
+    d_b = np.linalg.norm(seg - full_xz[i_b], axis=1)   # [m]
+    per_frame_max = np.maximum(d_a, d_b)               # [m]
+    return float(per_frame_max.max())
+
+
 def classify_revisit_pairs(
     episode: EpisodeData,
     distance_eps: float,
@@ -422,19 +452,34 @@ def classify_revisit_pairs(
     fps: int,
     diff_view_yaw: float = 60.0,
     max_pairs_dim: int = 500,
+    require_intermediate_separation: float = 0.0,
 ) -> Tuple[List[RevisitPair], Dict[str, int]]:
-    """对单 episode 内所有帧对做三类重访分类（+ 灰色地带计数）。
+    """对单 episode 内所有帧对做重访分类（含中间分离过滤 + stationary_view_change）。
 
-    类别定义（与任务规范一致）：
-      - location_revisit  : dist < distance_eps && |yaw| < yaw_eps && time_diff > time_long
-      - camera_swing      : dist < distance_eps*0.5 && |yaw| < yaw_eps && time_diff < time_short
-      - same_loc_diff_view: dist < distance_eps && |yaw| > diff_view_yaw && 任意时间差
+    类别定义（坐标单位为"数据集原生单位"，v4 中 ≈ inches；详见模块 docstring）：
+      - location_revisit  : dist < distance_eps && |yaw| < yaw_eps
+                            && time_diff > time_long
+                            && max_intermediate > require_intermediate_separation
+      - camera_swing      : dist < distance_eps*0.5 && |yaw| < yaw_eps
+                            && time_diff < time_short
+                            （不应用中间分离过滤——按定义短时近距，可以是静止）
+      - same_loc_diff_view: dist < distance_eps && |yaw| > diff_view_yaw
+                            && max_intermediate > require_intermediate_separation
       - grey_zone（仅计数）: dist < distance_eps && |yaw| < yaw_eps
                             && time_short <= time_diff <= time_long
-        （不进入 pairs 列表也不画截图；仅用于诊断阈值合理性）
+                            && max_intermediate > require_intermediate_separation
+      - stationary_view_change（仅计数）: dist < distance_eps
+                            && max_intermediate <= require_intermediate_separation
+                            && 不属于 camera_swing（camera_swing 优先级更高，避免双计）
+                            任意 Δt、任意 yaw 差。
+        （不进入 pairs 列表也不画截图；用于显式归宿原地静止/lookaround 场景）
+
+    require_intermediate_separation = 0 时关闭中间分离过滤，行为退化为本轮修改前
+    （location_revisit / same_loc_diff_view / grey_zone 不再要求 agent 离开过；
+    stationary_view_change 永远为 0）。
 
     返回 (pairs, counts)，counts 含 location_revisit/camera_swing/
-    same_loc_diff_view/grey_zone 四项。
+    same_loc_diff_view/grey_zone/stationary_view_change 五项。
     """
     xz, yaw_deg = extract_xz_and_yaw(episode.poses)
     T = episode.poses.shape[0]
@@ -458,34 +503,76 @@ def classify_revisit_pairs(
     yaw_u = yaw_mat[iu, ju]
     time_u = time_mat[iu, ju]
 
-    # 类别 mask
-    loc_revisit_mask = (
-        (dist_u < distance_eps) &
-        (yaw_u < yaw_eps) &
-        (time_u > time_long)
-    )
+    # 各类粗筛 mask（不含中间分离条件）
     cam_swing_mask = (
         (dist_u < distance_eps * 0.5) &
         (yaw_u < yaw_eps) &
         (time_u < time_short)
     )
-    same_loc_diff_view_mask = (
+    loc_revisit_pre_mask = (
+        (dist_u < distance_eps) &
+        (yaw_u < yaw_eps) &
+        (time_u > time_long)
+    )
+    same_loc_diff_view_pre_mask = (
         (dist_u < distance_eps) &
         (yaw_u > diff_view_yaw)
     )
-    grey_zone_mask = (
+    grey_zone_pre_mask = (
         (dist_u < distance_eps) &
         (yaw_u < yaw_eps) &
         (time_u >= time_short) &
         (time_u <= time_long)
     )
+    # stationary_view_change 的"距离接近"粗筛（不含中间分离条件）
+    # 注意：与 camera_swing 互斥，camera_swing 优先（下面在结果阶段处理）
+    stationary_pre_mask = (dist_u < distance_eps)
+
+    # ---- 中间分离过滤（性能优化：只对已经满足粗筛的候选对计算中间分离） ----
+    need_sep = require_intermediate_separation > 0.0
+    # 需要算中间分离的候选 = loc_revisit / same_loc_diff_view / grey_zone / stationary 的并集
+    # camera_swing 不算（按定义不应用中间分离过滤）
+    if need_sep:
+        candidate_mask = (
+            loc_revisit_pre_mask
+            | same_loc_diff_view_pre_mask
+            | grey_zone_pre_mask
+            | stationary_pre_mask
+        )
+        max_inter_u = np.zeros_like(dist_u, dtype=np.float32)
+        cand_idx_local = np.nonzero(candidate_mask)[0]
+        if cand_idx_local.size > 0:
+            for k in cand_idx_local:
+                a_full = int(sample_idx[iu[k]])
+                b_full = int(sample_idx[ju[k]])
+                if a_full > b_full:
+                    a_full, b_full = b_full, a_full
+                max_inter_u[k] = _compute_max_intermediate_separation(xz, a_full, b_full)
+        sep_pass = max_inter_u > require_intermediate_separation
+        sep_fail = ~sep_pass
+    else:
+        # 关闭过滤：所有候选都视为通过分离（loc_revisit 等不再限制），
+        # 且 stationary_view_change 应恒为 0（不存在"未通过分离"的对）。
+        sep_pass = np.ones_like(dist_u, dtype=bool)
+        sep_fail = np.zeros_like(dist_u, dtype=bool)
+
+    # 最终类别 mask
+    # camera_swing 优先级最高，先确定
+    final_cam_swing_mask = cam_swing_mask
+    # stationary_view_change：距离接近 + 未通过中间分离 + 不在 camera_swing 中
+    final_stationary_mask = stationary_pre_mask & sep_fail & (~final_cam_swing_mask)
+    # 其余三类：粗筛 + 通过中间分离
+    final_loc_revisit_mask = loc_revisit_pre_mask & sep_pass
+    final_same_loc_diff_view_mask = same_loc_diff_view_pre_mask & sep_pass
+    final_grey_zone_mask = grey_zone_pre_mask & sep_pass
 
     pairs: List[RevisitPair] = []
     counts = {
-        "location_revisit": int(loc_revisit_mask.sum()),
-        "camera_swing": int(cam_swing_mask.sum()),
-        "same_loc_diff_view": int(same_loc_diff_view_mask.sum()),
-        "grey_zone": int(grey_zone_mask.sum()),
+        "location_revisit": int(final_loc_revisit_mask.sum()),
+        "camera_swing": int(final_cam_swing_mask.sum()),
+        "same_loc_diff_view": int(final_same_loc_diff_view_mask.sum()),
+        "grey_zone": int(final_grey_zone_mask.sum()),
+        "stationary_view_change": int(final_stationary_mask.sum()),
     }
 
     def _append(mask: np.ndarray, label: str) -> None:
@@ -504,9 +591,10 @@ def classify_revisit_pairs(
                 )
             )
 
-    _append(loc_revisit_mask, "location_revisit")
-    _append(cam_swing_mask, "camera_swing")
-    _append(same_loc_diff_view_mask, "same_loc_diff_view")
+    _append(final_loc_revisit_mask, "location_revisit")
+    _append(final_cam_swing_mask, "camera_swing")
+    _append(final_same_loc_diff_view_mask, "same_loc_diff_view")
+    # 不把 stationary_view_change / grey_zone 加入 pairs 列表（保持 pairs.csv 只含三类截图所用对）
 
     return pairs, counts
 
@@ -537,8 +625,8 @@ def render_bev(
     ax.scatter([xz[-1, 0]], [xz[-1, 1]], c="red", s=80, marker="X", edgecolor="black",
                label="end", zorder=5)
     ax.set_aspect("equal", adjustable="datalim")
-    ax.set_xlabel("x (m)")
-    ax.set_ylabel("z (m)")
+    ax.set_xlabel("x (units)")
+    ax.set_ylabel("z (units)")
     ax.set_title(f"BEV trajectory — {episode.episode_id}\nT={T} frames, "
                  f"{len(episode.clips)} clips")
     ax.legend(loc="best", fontsize=8)
@@ -620,7 +708,7 @@ def render_pair_screenshot(
     axes[1].set_title(f"frame {pair.frame_b} (clip {episode.clips[b_clip_idx].clip_idx})")
     axes[1].axis("off")
     fig.suptitle(
-        f"{pair.pair_type} | dist={pair.dist_m:.2f}m | "
+        f"{pair.pair_type} | dist={pair.dist_m:.2f} units | "
         f"|yaw|={pair.yaw_diff_deg:.1f}° | Δt={pair.time_diff_sec:.1f}s",
         fontsize=11,
     )
@@ -655,8 +743,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--max_episodes", type=int, default=50,
                         help="未指定 episode_ids 时，从全部 episode 中随机采样的"
                              "上限（默认 50）；负数或 0 表示不限")
-    parser.add_argument("--distance_eps", type=float, default=1.0,
-                        help="同地点距离阈值，米（默认 1.0）")
+    parser.add_argument("--distance_eps", type=float, default=40.0,
+                        help="同地点距离阈值（数据集 pose 的原生单位；v4/CSGO 数据 "
+                             "≈ inches/game units，1m ≈ 40 units）。默认 40 ≈ 1m。")
     parser.add_argument("--yaw_eps", type=float, default=30.0,
                         help="同朝向角度阈值，度（默认 30.0）")
     parser.add_argument("--time_short", type=float, default=2.0,
@@ -680,6 +769,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--diff_view_yaw", type=float, default=60.0,
                         help="same_loc_diff_view 的 yaw 阈值，度（默认 60.0）；"
                              "|yaw| > diff_view_yaw 视为视角显著不同")
+    parser.add_argument("--require_intermediate_separation", type=float, default=100.0,
+                        help="中间分离阈值（同单位）。对位置重访/视角不同/灰色地带，"
+                             "要求存在中间帧 k ∈ (a, b)，使 max(dist(k, frame_a), "
+                             "dist(k, frame_b)) > 该阈值，即 agent 真的离开过端点附近。"
+                             "默认 100 ≈ 2.5m。设 0 关闭此过滤。"
+                             "camera_swing 不应用此过滤（按定义短时近距，可静止）；"
+                             "stationary_view_change 反向使用（dist 近 + 未通过分离）。")
     parser.add_argument("--force", action="store_true",
                         help="即使输出文件已存在也强制重新生成（BEV / 截图）")
     return parser.parse_args(argv)
@@ -740,11 +836,13 @@ def process_episode(
         fps=args.fps,
         diff_view_yaw=args.diff_view_yaw,
         max_pairs_dim=args.max_pairs_dim,
+        require_intermediate_separation=args.require_intermediate_separation,
     )
     stats.n_location_revisit = counts["location_revisit"]
     stats.n_camera_swing = counts["camera_swing"]
     stats.n_same_loc_diff_view = counts["same_loc_diff_view"]
     stats.n_grey_zone = counts.get("grey_zone", 0)
+    stats.n_stationary_view_change = counts.get("stationary_view_change", 0)
     stats.pairs = pairs
 
     # 2. 写 pairs CSV
@@ -817,6 +915,7 @@ def write_summary(
     total_swing = sum(s.n_camera_swing for s in per_episode_stats)
     total_diffview = sum(s.n_same_loc_diff_view for s in per_episode_stats)
     total_grey = sum(s.n_grey_zone for s in per_episode_stats)
+    total_stationary = sum(s.n_stationary_view_change for s in per_episode_stats)
     total_pairs_classified = total_loc + total_swing + total_diffview
 
     def _pct(n: int, denom: int) -> str:
@@ -859,6 +958,12 @@ def write_summary(
                 f"大量同地点对落在 [time_short, time_long] 灰色地带，"
                 "可考虑调宽 --time_long 阈值或降低 --time_short。"
             )
+        if total_stationary > total_loc * 2 and total_loc >= 0:
+            hints.append(
+                f"⚠️ stationary_view_change ({total_stationary}) > 2× 位置重访 "
+                f"({total_loc})：大量帧对是 agent 原地静止（lookaround / 停留观察）；"
+                "如要分析这类场景需单独处理（如 yaw-only revisit 子集）。"
+            )
     if global_warnings:
         hints.append(f"⚠️ 处理过程产生 {len(global_warnings)} 条 warning（详见日志）。")
 
@@ -869,6 +974,7 @@ def write_summary(
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "params": {
             "distance_eps": args.distance_eps,
+            "distance_eps_unit": "dataset native units (v4 ≈ inches; 1m ≈ 40 units)",
             "yaw_eps": args.yaw_eps,
             "time_short": args.time_short,
             "time_long": args.time_long,
@@ -878,6 +984,7 @@ def write_summary(
             "seed": args.seed,
             "clip_overlap_frames": args.clip_overlap_frames,
             "diff_view_yaw": args.diff_view_yaw,
+            "require_intermediate_separation": args.require_intermediate_separation,
         },
         "global": {
             "n_episodes": len(per_episode_stats),
@@ -888,6 +995,7 @@ def write_summary(
             "n_camera_swing": total_swing,
             "n_same_loc_diff_view": total_diffview,
             "n_grey_zone": total_grey,
+            "n_stationary_view_change": total_stationary,
             "pct_location_revisit": loc_pct,
             "pct_camera_swing": swing_pct,
             "pct_same_loc_diff_view": diffview_pct,
@@ -902,11 +1010,13 @@ def write_summary(
                     "camera_swing": s.n_camera_swing,
                     "same_loc_diff_view": s.n_same_loc_diff_view,
                     "grey_zone": s.n_grey_zone,
+                    "stationary_view_change": s.n_stationary_view_change,
                 },
                 "n_location_revisit": s.n_location_revisit,
                 "n_camera_swing": s.n_camera_swing,
                 "n_same_loc_diff_view": s.n_same_loc_diff_view,
                 "n_grey_zone": s.n_grey_zone,
+                "n_stationary_view_change": s.n_stationary_view_change,
                 "bev_path": s.bev_path,
                 "warnings": s.warnings,
             }
@@ -925,9 +1035,15 @@ def write_summary(
     md_lines.append(f"- 数据集: `{args.dataset_dir}` ({args.metadata})")
     md_lines.append(f"- 分析时间: {json_obj['generated_at']}")
     md_lines.append(
-        f"- 分析参数: distance_eps={args.distance_eps}m, yaw_eps={args.yaw_eps}°, "
+        f"- 分析参数（数据集原生单位）: distance_eps={args.distance_eps} units, "
+        f"yaw_eps={args.yaw_eps}°, "
         f"time_short={args.time_short}s, time_long={args.time_long}s, fps={args.fps}, "
-        f"diff_view_yaw={args.diff_view_yaw}°"
+        f"diff_view_yaw={args.diff_view_yaw}°, "
+        f"require_intermediate_separation={args.require_intermediate_separation} units"
+    )
+    md_lines.append(
+        "- 单位说明: v4/CSGO pose xyz 为 game units（≈ inches，1m ≈ 40 units）；"
+        "所有距离阈值以数据集原生单位为准。"
     )
     md_lines.append(
         f"- Clip overlap 处理: clip_overlap_frames={args.clip_overlap_frames} "
@@ -947,25 +1063,33 @@ def write_summary(
         f"(≈ {avg_duration:.1f} 秒 @ {args.fps}fps) |"
     )
     md_lines.append(
-        f"| **位置重访对** (Δt > {args.time_long}s, dist < {args.distance_eps}m, "
-        f"|yaw| < {args.yaw_eps}°) | {total_loc:,} ({loc_pct}) |"
+        f"| **位置重访对** (Δt > {args.time_long}s, dist < {args.distance_eps} units, "
+        f"|yaw| < {args.yaw_eps}°, 中间分离 > {args.require_intermediate_separation}) | "
+        f"{total_loc:,} ({loc_pct}) |"
     )
     md_lines.append(
         f"| **镜头摆动对** (Δt < {args.time_short}s, dist < "
-        f"{args.distance_eps*0.5}m, |yaw| < {args.yaw_eps}°) | "
+        f"{args.distance_eps*0.5} units, |yaw| < {args.yaw_eps}°) | "
         f"{total_swing:,} ({swing_pct}) |"
     )
     md_lines.append(
-        f"| **位置近视角不同** (dist < {args.distance_eps}m, "
-        f"|yaw| > {args.diff_view_yaw}°) | "
+        f"| **位置近视角不同** (dist < {args.distance_eps} units, "
+        f"|yaw| > {args.diff_view_yaw}°, 中间分离 > "
+        f"{args.require_intermediate_separation}) | "
         f"{total_diffview:,} ({diffview_pct}) |"
     )
     md_lines.append(
-        f"| 灰色地带 ([{args.time_short}s, {args.time_long}s] 内同地点同朝向) | "
+        f"| 灰色地带 ([{args.time_short}s, {args.time_long}s] 内同地点同朝向 "
+        f"+ 中间分离 > {args.require_intermediate_separation}) | "
         f"{total_grey:,} |"
     )
+    md_lines.append(
+        f"| stationary_view_change (dist < {args.distance_eps} units 但中间分离 "
+        f"≤ {args.require_intermediate_separation}；原地静止+视角变化) | "
+        f"{total_stationary:,} |"
+    )
     md_lines.append("")
-    md_lines.append("> 占比 = 该类对数 / 三类对数总和（灰色地带不计入占比，仅诊断用）。")
+    md_lines.append("> 占比 = 该类对数 / 三类对数总和（灰色地带 / stationary_view_change 不计入占比，仅诊断用）。")
     md_lines.append("")
     md_lines.append("## 结论提示")
     md_lines.append("")
@@ -978,14 +1102,15 @@ def write_summary(
     md_lines.append("## per-episode 表")
     md_lines.append("")
     md_lines.append("| episode_id | T 帧 | 时长(s) | 位置重访 | 镜头摆动 | "
-                    "位置近视角不同 | 灰色地带 | BEV |")
-    md_lines.append("|---|---|---|---|---|---|---|---|")
+                    "位置近视角不同 | 灰色地带 | stationary_view_change | BEV |")
+    md_lines.append("|---|---|---|---|---|---|---|---|---|")
     for s in per_episode_stats:
         bev_md = f"[bev]({s.bev_path})" if s.bev_path else "—"
         md_lines.append(
             f"| {s.episode_id} | {s.total_frames:,} | {s.duration_sec:.1f} | "
             f"{s.n_location_revisit:,} | {s.n_camera_swing:,} | "
-            f"{s.n_same_loc_diff_view:,} | {s.n_grey_zone:,} | {bev_md} |"
+            f"{s.n_same_loc_diff_view:,} | {s.n_grey_zone:,} | "
+            f"{s.n_stationary_view_change:,} | {bev_md} |"
         )
     md_lines.append("")
     if global_warnings:
