@@ -964,6 +964,26 @@ def _retrieve_pose_cosine(
     return idx.tolist()
 
 
+def _retrieve_pose_abs(
+    q: int,
+    abs_translations: torch.Tensor,   # [T, 3] 绝对 c2w 平移向量（世界坐标位置）
+    k: int,
+) -> List[int]:
+    """[0, q-1] 内按绝对位置 L2 距离最近的 top-k（诊断基线：location key）。
+
+    与 pose_cosine 的关键区别：pose_cosine 用 framewise 运动 pose_emb（编码"怎么动"），
+    本函数用绝对世界位置（编码"在哪"），用于验证"检索失败是否因为 key 是运动而非位置"。
+    """
+    if q == 0:
+        return []
+    query = abs_translations[q].float().unsqueeze(0)   # [1, 3]
+    past = abs_translations[:q].float()                # [q, 3]
+    dists = torch.norm(past - query, dim=-1)           # [q] L2 距离，越小越近
+    k_use = min(k, q)
+    _, idx = torch.topk(dists, k=k_use, largest=False)  # 最小的 k 个
+    return idx.tolist()
+
+
 # ---------------------------------------------------------------------------
 # 主评测循环
 # ---------------------------------------------------------------------------
@@ -984,6 +1004,10 @@ def _eval_episode(
     T = pose_embs.shape[0]
     k_values = sorted([int(x) for x in args.k_values.split(",")])
     k_max = max(k_values)
+
+    # 绝对世界位置（c2w 平移向量），用于 pose_abs 诊断基线
+    # ep.poses 为 [T,4,4] 绝对 c2w，与 pose_embs 同 T 同序（均源自 ep.poses）
+    abs_translations = torch.from_numpy(ep.poses[:, :3, 3]).float()  # [T, 3]
 
     # 1) 构造 bank + 逐帧 update
     bank = ThreeTierMemoryBank(
@@ -1007,7 +1031,7 @@ def _eval_episode(
 
     # 评测累计
     # method_key → k → [hits_sum, p_sum, r_sum, count]
-    method_keys = ["bank", "random", "temporal", "pose_cosine"]
+    method_keys = ["bank", "random", "temporal", "pose_cosine", "pose_abs"]
     agg: Dict[str, Dict[int, List[float]]] = {
         m: {k: [0.0, 0.0, 0.0, 0] for k in k_values} for m in method_keys
     }
@@ -1077,6 +1101,7 @@ def _eval_episode(
             random_topk = _retrieve_random(t, t, k_max, rng)
             temporal_topk = _retrieve_temporal(t, t, k_max)
             pose_cos_topk = _retrieve_pose_cosine(t, pose_embs, k_max)
+            pose_abs_topk = _retrieve_pose_abs(t, abs_translations, k_max)
 
             # 评测每个 k
             q_result = {
@@ -1089,6 +1114,7 @@ def _eval_episode(
                 ("random", random_topk),
                 ("temporal", temporal_topk),
                 ("pose_cosine", pose_cos_topk),
+                ("pose_abs", pose_abs_topk),
             ):
                 method_result: Dict[int, Dict[str, float]] = {}
                 for k in k_values:
@@ -1251,7 +1277,7 @@ def _write_summary(
             json.dump(ep_sum, fh, indent=2)
 
     # 全局汇总：对每个 (method, k) 取所有 query 的平均
-    method_keys = ["bank", "random", "temporal", "pose_cosine"]
+    method_keys = ["bank", "random", "temporal", "pose_cosine", "pose_abs"]
     global_metrics = {m: {k: {"precision": [], "recall": [], "hits": [], "n": 0}
                          for k in k_values} for m in method_keys}
     n_query_total = 0
