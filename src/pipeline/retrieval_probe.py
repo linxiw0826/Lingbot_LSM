@@ -984,6 +984,32 @@ def _retrieve_pose_abs(
     return idx.tolist()
 
 
+def _retrieve_pose_abs_gap(
+    q: int,
+    abs_translations: torch.Tensor,   # [T, 3] 绝对 c2w 平移
+    k: int,
+    min_gap_frames: int,              # 排除 q 之前这么多帧（time_gap）
+) -> List[int]:
+    """先排除最近 min_gap_frames 帧，再按绝对位置 L2 最近取 top-k。
+
+    与 _retrieve_pose_abs 的区别：只在 [0, q - min_gap_frames] 候选里检索，
+    排除"刚走过的近邻帧"（它们距离≈0 但被 GT 的 time_gap 条件排除），
+    使本基线成为"理想的地点重访检索器"。
+    """
+    # GT 候选条件是 q - i >= min_gap_frames（compute_gt_revisit），即排除 q-i < min_gap_frames。
+    # 候选集 {i : q-i >= min_gap_frames} = {i : i <= q - min_gap_frames}，故 cutoff = q - min_gap_frames + 1
+    # （abs_translations[:cutoff] 含索引 cutoff-1 = q - min_gap_frames），与 GT 排除窗口逐帧对齐。
+    cutoff = q - min_gap_frames + 1
+    if cutoff <= 0:
+        return []
+    query = abs_translations[q].float().unsqueeze(0)   # [1,3]
+    past = abs_translations[:cutoff].float()           # [cutoff,3]
+    dists = torch.norm(past - query, dim=-1)           # [cutoff]
+    k_use = min(k, cutoff)
+    _, idx = torch.topk(dists, k=k_use, largest=False)  # 最近的 k 个
+    return idx.tolist()
+
+
 # ---------------------------------------------------------------------------
 # 主评测循环
 # ---------------------------------------------------------------------------
@@ -1009,6 +1035,11 @@ def _eval_episode(
     # ep.poses 为 [T,4,4] 绝对 c2w，与 pose_embs 同 T 同序（均源自 ep.poses）
     abs_translations = torch.from_numpy(ep.poses[:, :3, 3]).float()  # [T, 3]
 
+    # pose_abs_gap 排除窗口：必须与 compute_gt_revisit 的 GT time_gap 排除
+    # （main: min_time_gap_frames = max(1, int(round(args.min_time_gap_sec * fps)))）
+    # 完全一致，否则 pose_abs_gap 候选与 GT 不对齐。
+    min_gap_frames = max(1, int(round(args.fps * args.min_time_gap_sec)))
+
     # 1) 构造 bank + 逐帧 update
     bank = ThreeTierMemoryBank(
         short_cap=args.short_cap,
@@ -1031,7 +1062,7 @@ def _eval_episode(
 
     # 评测累计
     # method_key → k → [hits_sum, p_sum, r_sum, count]
-    method_keys = ["bank", "random", "temporal", "pose_cosine", "pose_abs"]
+    method_keys = ["bank", "random", "temporal", "pose_cosine", "pose_abs", "pose_abs_gap"]
     agg: Dict[str, Dict[int, List[float]]] = {
         m: {k: [0.0, 0.0, 0.0, 0] for k in k_values} for m in method_keys
     }
@@ -1102,6 +1133,7 @@ def _eval_episode(
             temporal_topk = _retrieve_temporal(t, t, k_max)
             pose_cos_topk = _retrieve_pose_cosine(t, pose_embs, k_max)
             pose_abs_topk = _retrieve_pose_abs(t, abs_translations, k_max)
+            pose_abs_gap_topk = _retrieve_pose_abs_gap(t, abs_translations, k_max, min_gap_frames)
 
             # 评测每个 k
             q_result = {
@@ -1115,6 +1147,7 @@ def _eval_episode(
                 ("temporal", temporal_topk),
                 ("pose_cosine", pose_cos_topk),
                 ("pose_abs", pose_abs_topk),
+                ("pose_abs_gap", pose_abs_gap_topk),
             ):
                 method_result: Dict[int, Dict[str, float]] = {}
                 for k in k_values:
@@ -1277,7 +1310,7 @@ def _write_summary(
             json.dump(ep_sum, fh, indent=2)
 
     # 全局汇总：对每个 (method, k) 取所有 query 的平均
-    method_keys = ["bank", "random", "temporal", "pose_cosine", "pose_abs"]
+    method_keys = ["bank", "random", "temporal", "pose_cosine", "pose_abs", "pose_abs_gap"]
     global_metrics = {m: {k: {"precision": [], "recall": [], "hits": [], "n": 0}
                          for k in k_values} for m in method_keys}
     n_query_total = 0
