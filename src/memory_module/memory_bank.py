@@ -72,6 +72,9 @@ class MemoryFrame:
     # 新增字段（Orchestrator 2026-04-15 授权）
     semantic_key: Optional[Tensor] = None  # [dim=5120]，LongTermBank 写入/检索时使用，= mean(norm_k_i(k_i(pose_emb)) for all memory_layers)
     tier: str = ""                          # 标记所属层（"short"/"medium"/"long"），便于调试
+    # OP-2 Bug2 修复（重访检索）：绝对 c2w 平移向量 [3]，用于地点重访检索（按位置 L2）
+    # 默认 None 以向后兼容——现有所有构造点不传 location 也能工作。
+    location: Optional[Tensor] = None       # [3]，绝对 c2w 平移向量（世界位置）
 
 
 class MemoryBank:
@@ -704,6 +707,47 @@ class LongTermBank:
         _, indices = torch.topk(sims, k=k)
         return [self.frames[i] for i in indices.tolist()]
 
+    def retrieve_by_location(
+        self,
+        query_location: Tensor,       # [3] 当前帧绝对位置
+        query_timestep: int,          # 当前帧 timestep
+        top_k: int = 5,
+        min_gap_frames: int = 0,      # 排除 timestep 距离 < 此值的近邻帧
+        device=None,
+    ) -> List[MemoryFrame]:
+        """按绝对位置 L2 距离最近检索 top-k（Bug2），排除最近 min_gap_frames 帧（Bug3）。
+
+        OP-2 重访检索路径（全部新增、与现有 retrieve 并存，不替换）：
+          候选 = {f : f.location is not None and query_timestep - f.timestep >= min_gap_frames}
+          按 L2(f.location, query_location) 升序，返回最近 top_k。
+
+        与 retrieval_probe._retrieve_pose_abs_gap 的逻辑（L2 + 排除近邻 + largest=False）
+        保持一致，便于对照诊断。
+
+        Args:
+            query_location:  [3] 当前帧绝对 c2w 平移向量（世界位置）
+            query_timestep:  当前帧 timestep
+            top_k:           返回帧数上限
+            min_gap_frames:  排除 timestep 距离 < 此值的近邻帧（Bug3 近邻污染修复）
+            device:          保留参数（frames 存 CPU tensor，调用方负责 .to(device)）
+
+        Returns:
+            List[MemoryFrame]，按 L2 距离升序（最近优先），长度 ≤ top_k；
+            无满足条件的候选时返回 []。
+        """
+        cands = [
+            f for f in self.frames
+            if f.location is not None and (query_timestep - f.timestep) >= min_gap_frames
+        ]
+        if not cands:
+            return []
+        q = query_location.float().cpu().view(-1)
+        locs = torch.stack([f.location.float().cpu().view(-1) for f in cands])  # [M,3]
+        dists = torch.norm(locs - q.unsqueeze(0), dim=-1)  # [M]
+        k = min(top_k, len(cands))
+        _, idx = torch.topk(dists, k=k, largest=False)  # 最近
+        return [cands[i] for i in idx.tolist()]
+
     def clear(self) -> None:
         """清空 LongTermBank。"""
         self.frames.clear()
@@ -806,6 +850,7 @@ class ThreeTierMemoryBank:
         visual_emb: Optional[Tensor] = None,
         chunk_id: int = 0,
         semantic_key: Optional[Tensor] = None,
+        location: Optional[Tensor] = None,
     ) -> None:
         """存入一帧（按路由规则分发到各层）。
 
@@ -820,6 +865,8 @@ class ThreeTierMemoryBank:
             chunk_id:       所属 chunk 编号
             semantic_key:   [dim=5120] 由 model_with_memory.get_semantic_key() 计算
                             （待 model_with_memory.py 实现 get_semantic_key() 后传入）
+            location:       [3] 绝对 c2w 平移向量（世界位置），用于 retrieve_revisit
+                            地点重访检索（OP-2 Bug2 修复）；None 时该帧不参与重访检索（向后兼容）
         """
         frame = MemoryFrame(
             pose_emb=pose_emb.detach().cpu(),
@@ -830,6 +877,7 @@ class ThreeTierMemoryBank:
             chunk_id=int(chunk_id),
             age=0,
             semantic_key=semantic_key.detach().cpu() if semantic_key is not None else None,
+            location=location.detach().cpu() if location is not None else None,
         )
 
         # 路由规则：各层独立写入（各层 update() 会写 frame.tier，需传入独立副本避免互相覆盖）
@@ -943,6 +991,38 @@ class ThreeTierMemoryBank:
         tier_id_list = [_TIER_MAP.get(f.tier, 0) for f in selected_frames]
         tier_ids = torch.tensor(tier_id_list, dtype=torch.long, device=device)  # [K]
         return pose_embs, visual_embs, tier_ids
+
+    def retrieve_revisit(
+        self,
+        query_location: Tensor,
+        query_timestep: int,
+        top_k: int = 5,
+        min_gap_frames: int = 0,
+        device=None,
+    ) -> List[MemoryFrame]:
+        """地点重访检索：只走 Long tier（Bug3：避开 short/medium 的近邻帧）+ 位置 L2（Bug2）。
+
+        OP-2 重访检索路径（全部新增、与现有 retrieve 并存，不替换）。
+        只查 self.long（LongTermBank），避免 short/medium tier 装满最近帧时
+        在合并检索里挤掉 Long tier 的老重访帧（Bug3 近邻污染）。
+
+        Args:
+            query_location:  [3] 当前帧绝对 c2w 平移向量（世界位置）
+            query_timestep:  当前帧 timestep
+            top_k:           返回帧数上限
+            min_gap_frames:  排除 timestep 距离 < 此值的近邻帧
+            device:          保留参数
+
+        Returns:
+            List[MemoryFrame]，按位置 L2 距离升序，长度 ≤ top_k。
+        """
+        return self.long.retrieve_by_location(
+            query_location=query_location,
+            query_timestep=query_timestep,
+            top_k=top_k,
+            min_gap_frames=min_gap_frames,
+            device=device,
+        )
 
     def increment_age(self) -> None:
         """只对 MediumTermBank 帧 +1（Long/Short 不依赖 age decay）。

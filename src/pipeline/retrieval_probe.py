@@ -1062,7 +1062,7 @@ def _eval_episode(
 
     # 评测累计
     # method_key → k → [hits_sum, p_sum, r_sum, count]
-    method_keys = ["bank", "random", "temporal", "pose_cosine", "pose_abs", "pose_abs_gap"]
+    method_keys = ["bank", "bank_revisit", "random", "temporal", "pose_cosine", "pose_abs", "pose_abs_gap"]
     agg: Dict[str, Dict[int, List[float]]] = {
         m: {k: [0.0, 0.0, 0.0, 0] for k in k_values} for m in method_keys
     }
@@ -1134,6 +1134,15 @@ def _eval_episode(
             pose_cos_topk = _retrieve_pose_cosine(t, pose_embs, k_max)
             pose_abs_topk = _retrieve_pose_abs(t, abs_translations, k_max)
             pose_abs_gap_topk = _retrieve_pose_abs_gap(t, abs_translations, k_max, min_gap_frames)
+            # bank_revisit：OP-2 修复路径（绝对位置 L2 + 排除近邻 + 只走 Long tier）。
+            # min_gap_frames 与 GT / pose_abs_gap 同口径（同为 max(1, round(fps*min_time_gap_sec))）。
+            revisit_frames = bank.retrieve_revisit(
+                query_location=abs_translations[t],
+                query_timestep=t,
+                top_k=k_max,
+                min_gap_frames=min_gap_frames,
+            )
+            bank_revisit_topk = [f.timestep for f in revisit_frames]
 
             # 评测每个 k
             q_result = {
@@ -1143,6 +1152,7 @@ def _eval_episode(
             }
             for method, retrieved_list in (
                 ("bank", bank_topk_ts),
+                ("bank_revisit", bank_revisit_topk),
                 ("random", random_topk),
                 ("temporal", temporal_topk),
                 ("pose_cosine", pose_cos_topk),
@@ -1178,6 +1188,7 @@ def _eval_episode(
                 visual_emb=frame_visual.float() if frame_visual is not None else None,
                 chunk_id=int(t // 21),    # 21 latent 帧 ≈ 1 clip
                 semantic_key=sk,
+                location=abs_translations[t].float(),  # [3] 绝对位置（OP-2 重访检索 Bug2 修复）
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("bank.update failed at ep=%s t=%d: %s",
@@ -1310,7 +1321,7 @@ def _write_summary(
             json.dump(ep_sum, fh, indent=2)
 
     # 全局汇总：对每个 (method, k) 取所有 query 的平均
-    method_keys = ["bank", "random", "temporal", "pose_cosine", "pose_abs", "pose_abs_gap"]
+    method_keys = ["bank", "bank_revisit", "random", "temporal", "pose_cosine", "pose_abs", "pose_abs_gap"]
     global_metrics = {m: {k: {"precision": [], "recall": [], "hits": [], "n": 0}
                          for k in k_values} for m in method_keys}
     n_query_total = 0
