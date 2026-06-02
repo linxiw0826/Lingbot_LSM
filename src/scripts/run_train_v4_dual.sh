@@ -4,6 +4,11 @@ set -euo pipefail
 # ============================================================
 # 用户配置区 — 修改以下变量后运行 bash run_train_v4_dual.sh
 # ============================================================
+# 可用环境变量覆盖（无需编辑本文件）：
+#   CUDA_VISIBLE_DEVICES / RESUME_FROM_LOW / RESUME_FROM_HIGH / DATASET_DIR / PHASE / NUM_EPOCHS
+# 示例（2 卡从头训）：CUDA_VISIBLE_DEVICES=0,1 bash src/scripts/run_train_v4_dual.sh
+# 默认从头训练（RESUME_FROM_LOW 为空）；如需续训：RESUME_FROM_LOW=.../epoch_N bash run_train_v4_dual.sh
+# ============================================================
 # 实验配置 ⑦：v4 数据 + Stage1 + 双模型，Innovation 6-10
 # 方法：Method B 多 clip 顺序训练，ThreeTierMemoryBank
 #
@@ -18,18 +23,18 @@ set -euo pipefail
 #   - LONG_CAP 默认值改为 32（v4 扩容）
 
 CKPT_DIR="/home/nvme02/lingbot-world/models/lingbot-world-base-act"
-DATASET_DIR="/home/nvme02/Memory-dataset/v4_dynamic_all46"            # v4 数据集目录
-PHASE="exp"                  # 训练阶段："exp"（ep01-11）或 "full"（ep01-46）
+DATASET_DIR="${DATASET_DIR:-/home/nvme02/Memory-dataset/v4_dynamic_all46}"            # v4 数据集目录
+PHASE="${PHASE:-exp}"                  # 训练阶段："exp"（ep01-11）或 "full"（ep01-46）
 OUTPUT_BASE="/home/nvme02/wlx/Memory/outputs"
 OUTPUT_DIR="${OUTPUT_BASE}/train/v4_stage1_dual"
 # RESUME_FROM_LOW=""         # low 模型断点续训路径（留空从头开始）
-RESUME_FROM_LOW="/home/nvme02/wlx/Memory/outputs/train/v4_stage1_dual/low_noise_model/epoch_4"
-RESUME_FROM_HIGH=""        # high 模型断点续训路径（留空从头开始）
+RESUME_FROM_LOW="${RESUME_FROM_LOW:-}"
+RESUME_FROM_HIGH="${RESUME_FROM_HIGH:-}"        # high 模型断点续训路径（留空从头开始）
 
 LORA_RANK=0                # LoRA rank：0=全参微调；32/64=LoRA微调
 LORA_TARGET_MODULES=""     # LoRA目标模块（留空自动检测）
 
-NUM_EPOCHS=5
+NUM_EPOCHS="${NUM_EPOCHS:-5}"
 LEARNING_RATE=1e-4
 LR_DIT=1e-5
 WEIGHT_DECAY=0.01
@@ -60,7 +65,7 @@ HYBRID_MEDIUM_K=3          # 混合检索预算中 Medium 层 top-K
 HYBRID_LONG_K=2            # 混合检索预算中 Long 层 top-K
 DUP_THRESHOLD=0.95         # cross-tier dedup 阈值（pose_emb cosine_sim > 阈值则去重）
 
-CUDA_VISIBLE_DEVICES="0,1,2,3,4,5"
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5}"
 
 # ============================================================
 # 以下内容通常无需修改
