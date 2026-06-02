@@ -20,9 +20,14 @@ oracle / off / wrong 的差别**不能**用来肯定或否定 idea。
 ---------------------
 | --tier_config | 含义 | 测什么 |
 |---------------|------|-------|
-| full         | 弱化首帧 + Short/Medium/Long 全保留（+ oracle 帧注入） | Memory Bank 整体能不能用（最宽松） |
-| medium_long  | 弱化首帧 + 关 Short（Medium+Long 保留，+ oracle 帧注入） | Medium+Long 能不能用（idea 主打） |
-| oracle_only  | 弱化首帧 + 三层全关，**只注入 oracle GT 帧** | 注入本身有没有被用到（最严格） |
+| full         | 弱化首帧 + 注入 **bank Short+Medium+Long 检索帧** | Memory Bank 整体能不能用（最宽松） |
+| medium_long  | 弱化首帧 + 注入 **bank Medium+Long 检索帧** | Medium+Long 能不能用（idea 主打） |
+| oracle_only  | 弱化首帧 + 三层全关，**只注入 oracle GT 帧**（绕过 bank） | 注入本身有没有被用到（最严格） |
+
+full / medium_long 档（memory_mode=oracle）现在真正消费 bank：先 populate bank over
+episode（query clip 之前的帧，逐帧 bank.update，口径同 retrieval_probe._eval_episode），
+再从启用的 tier 检索（Long 用位置检索 retrieve_revisit / Medium 用 medium.retrieve /
+Short 用 short.retrieve_all），把检索帧构造成 memory K/V 注入。检索方式与 Exp1 探针同源。
 
 注入内容对照（--memory_mode）
 -----------------------------
@@ -46,12 +51,15 @@ oracle / off / wrong 的差别**不能**用来肯定或否定 idea。
 - 代码风格与 infer_v4 / retrieval_probe 一致（中文注释 / type hints / docstring）
 - 单 GPU 即可运行（不强制多卡；本脚本不支持 Ulysses SP，逻辑更清晰）
 
-跨模块数据契约（oracle 帧注入）
--------------------------------
-- memory_states (K)       : [1, K, 5120]，oracle GT 帧的 pose_emb（get_projected_frame_embs）
-- memory_value_states (V) : [1, K, 5120]，oracle GT 帧的 visual_emb（get_projected_latent_emb）
-- tier_ids                : [K] int64（oracle_only 模式标 long=2）或 None
-  消费方：_patch_pipeline_memory → MemoryCrossAttention.forward（与 bank 检索路径同接口）
+跨模块数据契约（oracle 帧注入 / bank 检索帧注入，同一契约）
+-----------------------------------------------------------
+- memory_states (K)       : [1, K, 5120]，pose_emb（get_projected_frame_embs）
+                            oracle_only=oracle GT 帧；full/medium_long=bank 检索帧的 frame.pose_emb
+- memory_value_states (V) : [1, K, 5120]，visual_emb（get_projected_latent_emb）
+- tier_ids                : [K] int64 或 None
+                            oracle_only / wrong：全标 long=2；
+                            full/medium_long：按检索帧来源标 Short=0/Medium=1/Long=2
+  消费方：_patch_pipeline_memory → MemoryCrossAttention.forward（两条注入路径同接口）
 """
 
 from __future__ import annotations
@@ -208,6 +216,9 @@ from pipeline.retrieval_probe import (  # noqa: E402
     _decode_episode_video,
     _vae_encode_batched,
     _expand_latents_to_frames,
+    _compute_pose_embs_episode,
+    _compute_visual_embs_from_latents,
+    _compute_surprise_visual_cosine,
 )
 
 # 复用 infer_v4 的 pipeline 装载/转换/注入（import，不重写）
@@ -419,6 +430,213 @@ _ORACLE_CLIP_FRAMES: int = 81
 
 
 # ---------------------------------------------------------------------------
+# Bank populate + 检索（full / medium_long 档：让 bank 真正被消费，
+# 复用 retrieval_probe._eval_episode 的逐帧 update + retrieve 口径）
+# ---------------------------------------------------------------------------
+
+def _semantic_key_for_frame(
+    pose_emb: torch.Tensor,
+    visual_emb: Optional[torch.Tensor],
+    alpha: float,
+) -> torch.Tensor:
+    """逐帧 semantic_key（口径与 retrieval_probe._eval_episode._semantic_key 完全一致）。
+
+    semantic_key = alpha * normalize(pose_emb) + (1-alpha) * normalize(visual_emb)
+    （visual_emb is None 时退化为 normalize(pose_emb)）。
+
+    注：retrieval_probe 同样用 raw normalize（而非走 cross-attn K 投影），原因见
+    retrieval_probe summary 偏差说明 1（K 投影层在 epoch_4 前零梯度，raw normalize 更稳）。
+    """
+    pk = F.normalize(pose_emb.float().unsqueeze(0), dim=-1).squeeze(0)
+    if visual_emb is None:
+        return pk
+    vk = F.normalize(visual_emb.float().unsqueeze(0), dim=-1).squeeze(0)
+    return alpha * pk + (1.0 - alpha) * vk
+
+
+def _populate_bank(
+    bank,
+    ep: EpisodeData,
+    query_clip_start: int,
+    pose_embs: torch.Tensor,        # [T, 5120] CPU
+    visual_embs: Optional[torch.Tensor],   # [T, 5120] CPU 或 None
+    surprise: torch.Tensor,         # [T] CPU
+    latents_per_frame: torch.Tensor,  # [T, z_dim, lat_h, lat_w] CPU
+    abs_translations: torch.Tensor,  # [T, 3] CPU 绝对位置
+    args,
+) -> None:
+    """对 query clip 之前的所有帧 [0, query_clip_start) 逐帧 bank.update（populate bank）。
+
+    逐帧量计算方式与 retrieval_probe._eval_episode 完全一致：
+      - pose_emb / visual_emb：传入的 [T,5120]（_compute_pose_embs_episode /
+        _compute_visual_embs_from_latents 产出，与探针同源）
+      - surprise：传入的 [T]
+      - semantic_key：_semantic_key_for_frame（= alpha*norm(pose)+(1-alpha)*norm(visual)）
+      - location：abs_translations[t]（= ep.poses[:, :3, 3]）
+      - timestep：t；chunk_id：t // 21；increment_age：每 21 帧一次（clip 边界）
+
+    Args:
+        bank:              ThreeTierMemoryBank（_build_bank_for_config 构建）
+        ep:                EpisodeData
+        query_clip_start:  query clip 起始帧（全局索引）；只填 [0, query_clip_start)
+        pose_embs/visual_embs/surprise/latents_per_frame/abs_translations: episode 全帧量
+        args:              CLI args（提供 visual_fusion_alpha）
+    """
+    T = pose_embs.shape[0]
+    end = max(0, min(query_clip_start, T))
+    for t in range(end):
+        try:
+            frame_visual = visual_embs[t] if visual_embs is not None else None
+            sk = _semantic_key_for_frame(
+                pose_embs[t], frame_visual, args.visual_fusion_alpha
+            )
+            bank.update(
+                pose_emb=pose_embs[t].float(),
+                latent=latents_per_frame[t].float() if latents_per_frame is not None
+                else torch.zeros(1),
+                surprise_score=float(surprise[t].item()),
+                timestep=int(t),
+                visual_emb=frame_visual.float() if frame_visual is not None else None,
+                chunk_id=int(t // 21),   # 21 latent 帧 ≈ 1 clip（与 retrieval_probe 一致）
+                semantic_key=sk,
+                location=abs_translations[t].float(),  # [3] 绝对位置（OP-2 Bug2 口径）
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("populate bank.update failed at ep=%s t=%d: %s",
+                           ep.episode_id, t, exc)
+            continue
+        # age increment 按 clip 边界（每 21 frame），与 retrieval_probe._eval_episode 一致
+        if t > 0 and (t % 21) == 0:
+            bank.increment_age()
+
+
+def _retrieve_bank_kv(
+    bank,
+    query_location: torch.Tensor,    # [3] CPU
+    query_pose_emb: torch.Tensor,    # [5120] CPU
+    query_semantic_key: torch.Tensor,  # [5120] CPU
+    query_timestep: int,
+    tier_config: str,
+    model,
+    latents_per_frame: torch.Tensor,  # [T, z_dim, lat_h, lat_w] CPU
+    args,
+    device: torch.device,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """按 tier_config 从启用的 tier 检索 MemoryFrame，构造注入用 K/V + tier_ids。
+
+    检索（口径与 retrieval_probe._eval_episode 同源）：
+      - Long（所有非 oracle_only 档）：bank.long.retrieve_by_location(
+            query_location, query_timestep, top_k=long_cap, min_gap_frames)
+        min_gap_frames = max(1, round(fps * min_time_gap_sec))（与 GT / 探针同口径）
+      - Medium（medium_long / full）：bank.medium.retrieve(query_pose_emb, top_k=medium_cap)
+      - Short（仅 full）：bank.short.retrieve_all()[:short_cap]
+
+    每帧 → K=get_projected_frame_embs（取该帧 pose_emb 已在 frame.pose_emb 中）/
+    V=get_projected_latent_emb（用 latents_per_frame[frame.timestep] 重算，
+    与 _build_oracle_memory_kv 同样的 V 构造方式）。
+
+    tier_ids：Short=0 / Medium=1 / Long=2（按帧来源赋，Innovation 10 同口径）。
+
+    Returns:
+        (memory_states_kv, memory_value_kv, tier_ids)：
+          memory_states_kv  [K,5120] CPU（K，pose_emb）
+          memory_value_kv   [K,5120] CPU（V，visual_emb）
+          tier_ids          [K] int64 CPU
+        无任何检索结果时返回 None。
+    """
+    from memory_module.model_with_memory import WanModelWithMemory
+
+    if not isinstance(model, WanModelWithMemory):
+        logger.warning("model 非 WanModelWithMemory，无法构造 bank 检索 K/V")
+        return None
+
+    T = latents_per_frame.shape[0] if latents_per_frame is not None else 0
+
+    # min_gap_frames：与 GT / retrieval_probe._retrieve_pose_abs_gap 同口径
+    min_gap_frames = max(1, int(round(args.fps * args.min_time_gap_sec)))
+
+    # 按 tier_config 收集 (MemoryFrame, tier_id)
+    collected: List[Tuple["object", int]] = []
+
+    # Long：所有非 oracle_only 档都启用（位置检索，F-14）
+    long_frames = bank.retrieve_revisit(
+        query_location=query_location,
+        query_timestep=query_timestep,
+        top_k=args.long_cap,
+        min_gap_frames=min_gap_frames,
+    )
+    for f in long_frames:
+        collected.append((f, 2))
+
+    # Medium：medium_long / full 启用
+    if tier_config in ("medium_long", "full"):
+        medium_frames = bank.medium.retrieve(
+            query_pose_emb.float(), top_k=args.medium_cap, device=None
+        )
+        for f in medium_frames:
+            collected.append((f, 1))
+
+    # Short：仅 full 启用
+    if tier_config == "full":
+        short_cap = bank.short.cap if bank.short.cap > 0 else 1
+        short_frames = bank.short.retrieve_all(device=None)[:short_cap]
+        for f in short_frames:
+            collected.append((f, 0))
+
+    if not collected:
+        return None
+
+    # 确保相关投影层在 device（offload 安全，与 _build_oracle_memory_kv 一致）
+    if hasattr(model, "latent_proj"):
+        model.latent_proj.to(device)
+
+    key_list: List[torch.Tensor] = []
+    val_list: List[torch.Tensor] = []
+    tier_id_list: List[int] = []
+
+    for frame, tier_id in collected:
+        # --- K：该帧的 pose_emb（populate 时已存入 frame.pose_emb，与
+        # _build_oracle_memory_kv 经 get_projected_frame_embs 算出的 pose_emb 同源）---
+        try:
+            pose_emb = frame.pose_emb.float().cpu()  # [5120]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("bank K 取用失败 t=%s: %s；跳过该帧",
+                           getattr(frame, "timestep", "?"), exc)
+            continue
+
+        # --- V：该帧的 visual_emb（用 latents_per_frame[frame.timestep] 经
+        # get_projected_latent_emb 重算，与 _build_oracle_memory_kv 同样构造）---
+        fi = int(getattr(frame, "timestep", -1))
+        if 0 <= fi < T and latents_per_frame is not None:
+            try:
+                lat = latents_per_frame[fi].to(device)  # [z_dim,lat_h,lat_w]
+                with torch.no_grad():
+                    visual_emb = model.get_projected_latent_emb(lat).float().cpu()  # [5120]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("bank V 计算失败 t=%d: %s；回退 frame.visual_emb", fi, exc)
+                visual_emb = (frame.visual_emb.float().cpu()
+                              if getattr(frame, "visual_emb", None) is not None
+                              else pose_emb)
+        else:
+            # timestep 越界或无 latent：回退到 populate 时存入的 visual_emb（向后兼容）
+            visual_emb = (frame.visual_emb.float().cpu()
+                          if getattr(frame, "visual_emb", None) is not None
+                          else pose_emb)
+
+        key_list.append(pose_emb)
+        val_list.append(visual_emb)
+        tier_id_list.append(tier_id)
+
+    if not key_list:
+        return None
+
+    key_states = torch.stack(key_list)    # [K,5120]
+    value_states = torch.stack(val_list)  # [K,5120]
+    tier_ids = torch.tensor(tier_id_list, dtype=torch.long)  # [K]
+    return key_states, value_states, tier_ids
+
+
+# ---------------------------------------------------------------------------
 # 轻量一致性指标（D-06：第一轮用最简单可跑的）
 # ---------------------------------------------------------------------------
 
@@ -479,7 +697,7 @@ def _revisit_consistency(
 
 def _generate_for_point(
     wan_i2v,
-    bank_or_none,
+    bank_kv: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
     oracle_kv: Optional[Tuple[torch.Tensor, torch.Tensor]],
     wrong_kv: Optional[Tuple[torch.Tensor, torch.Tensor]],
     point: RevisitPoint,
@@ -494,11 +712,14 @@ def _generate_for_point(
 
     流程：
       a. 弱化首帧条件（按 --weaken_first_frame）
-      b. 配置注入 K/V：
-         - memory_mode=off：memory_states=None（不注入）
-         - memory_mode=oracle：注入 oracle_kv
-         - memory_mode=wrong：注入 wrong_kv
-         - tier_config=full/medium_long：bank 路径预留（REVIEW-NOTE，见下）
+      b. 配置注入 K/V（三档统一语义）：
+         - memory_mode=off：memory_states=None（不注入，所有档 baseline）
+         - memory_mode=wrong：注入 wrong_kv（错误帧控制组，所有档通用）
+         - memory_mode=oracle：注入"该档配置的记忆源"——
+             · tier_config=oracle_only：注入 oracle GT 帧（oracle_kv，绕过 bank，保持现状）
+             · tier_config=full / medium_long：注入 bank_kv（bank 检索帧 + tier_ids），
+               由外层 _retrieve_bank_kv 按启用 tier 检索构造（full=Short+Medium+Long，
+               medium_long=Medium+Long）
       c. 跑生成（复用 infer_v4 的 _patch_pipeline_memory + wan_i2v.generate）
     """
     from memory_module.model_with_memory import WanModelWithMemory
@@ -516,31 +737,40 @@ def _generate_for_point(
     np.save(os.path.join(tmp_action_dir, "action.npy"), acts_c.astype(np.float32))
     np.save(os.path.join(tmp_action_dir, "intrinsics.npy"), intr_c.astype(np.float32))
 
-    # --- 选择注入 K/V ---
+    # --- 选择注入 K/V（三档统一语义，见 docstring b）---
     memory_states = None
     memory_value_states = None
     tier_ids = None
 
     if args.memory_mode == "off":
+        # 所有档：不注入（baseline）
         memory_states = None
-    else:
-        kv = oracle_kv if args.memory_mode == "oracle" else wrong_kv
-        if kv is not None:
-            key_states, value_states = kv
+    elif args.memory_mode == "wrong":
+        # 所有档：注入 wrong_kv（错误帧控制组），tier_ids 标 long(2)
+        if wrong_kv is not None:
+            key_states, value_states = wrong_kv
             memory_states = key_states.unsqueeze(0).to(device)         # [1,K,5120]
             memory_value_states = value_states.unsqueeze(0).to(device)  # [1,K,5120]
-            # tier_ids：oracle_only 标 long(2)；full/medium_long 也标 long（oracle 帧语义=长期重访记忆）
             tier_ids = torch.full(
                 (key_states.shape[0],), 2, dtype=torch.long, device=device
             )
-
-    # REVIEW-NOTE（无对应 OPEN 决策；待 ReviewAgent / 用户拍板，见汇报「需决策点」）：
-    # full / medium_long 模式下，"oracle GT 帧" 与 "bank 三层检索帧" 如何混合注入尚未定。
-    # 当前实现（第一版）：oracle 模式只注入 oracle GT 帧，不叠加 bank 检索帧；
-    # tier_config 仅通过 _build_bank_for_config 控制启用哪些层、但本版未把 bank 检索结果
-    # 与 oracle K/V 合并 → 三档当前差异主要体现在 tier_ids 语义与 bank 是否构建上。
-    # 候选方案：full=oracle帧 + Short/Medium/Long 检索帧并集；
-    #          medium_long=oracle帧 + Medium/Long 检索帧；oracle_only=仅 oracle 帧（已实现）。
+    else:  # memory_mode == "oracle"：注入"该档配置的记忆源"
+        if args.tier_config == "oracle_only":
+            # oracle_only：注入 oracle GT 帧（绕过 bank，保持现状不动），tier_ids 标 long(2)
+            if oracle_kv is not None:
+                key_states, value_states = oracle_kv
+                memory_states = key_states.unsqueeze(0).to(device)         # [1,K,5120]
+                memory_value_states = value_states.unsqueeze(0).to(device)  # [1,K,5120]
+                tier_ids = torch.full(
+                    (key_states.shape[0],), 2, dtype=torch.long, device=device
+                )
+        else:
+            # full / medium_long：注入 bank 检索帧（含来源 tier_ids）
+            if bank_kv is not None:
+                key_states, value_states, bank_tier_ids = bank_kv
+                memory_states = key_states.unsqueeze(0).to(device)         # [1,K,5120]
+                memory_value_states = value_states.unsqueeze(0).to(device)  # [1,K,5120]
+                tier_ids = bank_tier_ids.to(device)                        # [K]，Short0/Medium1/Long2
 
     max_area = MAX_AREA_CONFIGS[args.size]
 
@@ -679,6 +909,40 @@ def main():
             logger.warning("Episode %s 解码/encode 失败: %s；跳过", ep_id, exc)
             continue
 
+        # full / medium_long + oracle 档：预计算 bank populate 所需逐帧量
+        # （pose_emb / visual_emb / surprise / 绝对位置），口径与 retrieval_probe 同源。
+        # oracle_only 档及 off/wrong 模式不需要 bank → 不计算（保持现状路径不动）。
+        need_bank = (args.tier_config != "oracle_only" and args.memory_mode == "oracle")
+        ep_pose_embs = None
+        ep_visual_embs = None
+        ep_surprise = None
+        ep_abs_translations = None
+        if need_bank:
+            try:
+                ep_pose_embs = _compute_pose_embs_episode(
+                    ep, model, device, height=height, width=width, fps=args.fps,
+                )  # [T,5120]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Episode %s pose_embs 计算失败: %s；跳过 bank populate",
+                               ep_id, exc)
+                need_bank = False
+            if need_bank:
+                try:
+                    ep_visual_embs = _compute_visual_embs_from_latents(
+                        latents_per_frame, model, device,
+                    )  # [T,5120]
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Episode %s visual_embs 计算失败: %s；continue with None",
+                                   ep_id, exc)
+                    ep_visual_embs = None
+                # surprise：用 visual_cosine（自包含，无 NFP 依赖；与 retrieval_probe fallback 同函数）
+                if ep_visual_embs is not None:
+                    ep_surprise = _compute_surprise_visual_cosine(ep_visual_embs)
+                else:
+                    ep_surprise = torch.zeros(T, dtype=torch.float32)
+                # 绝对世界位置（c2w 平移），与 retrieval_probe._eval_episode 同口径
+                ep_abs_translations = torch.from_numpy(ep.poses[:, :3, 3]).float()  # [T,3]
+
         ep_out_dir = os.path.join(args.output_dir, ep_id)
         os.makedirs(ep_out_dir, exist_ok=True)
 
@@ -705,13 +969,46 @@ def main():
             wrong_kv = _build_oracle_memory_kv(
                 model, wan_i2v, ep, latents_per_frame, wrong_indices, device)
 
-            # full / medium_long 模式下构建 bank（预留；REVIEW-NOTE 见 _generate_for_point）
-            bank = _build_bank_for_config(args) if args.tier_config != "oracle_only" else None
+            # full / medium_long + oracle 档：构建 bank → populate [0, query_clip_start)
+            # → 从启用的 tier 检索 → 构造注入 K/V（bank_kv）。oracle_only / off / wrong 路径不走此处。
+            bank_kv = None
+            if need_bank and ep_pose_embs is not None:
+                bank = _build_bank_for_config(args)
+                # query clip 起始帧（与 _generate_for_point 内 _frame_to_clip_slice 对齐）
+                _qpc, _qac, _qic, q_clip_start = _frame_to_clip_slice(
+                    ep, pt.query_frame, args.frame_num)
+                _populate_bank(
+                    bank, ep, q_clip_start,
+                    ep_pose_embs, ep_visual_embs, ep_surprise,
+                    latents_per_frame, ep_abs_translations, args,
+                )
+                # query 侧逐帧量（location / pose_emb / semantic_key），口径同 populate
+                q_idx = min(max(pt.query_frame, 0), T - 1)
+                q_visual = ep_visual_embs[q_idx] if ep_visual_embs is not None else None
+                q_semantic_key = _semantic_key_for_frame(
+                    ep_pose_embs[q_idx], q_visual, args.visual_fusion_alpha)
+                bank_kv = _retrieve_bank_kv(
+                    bank,
+                    query_location=ep_abs_translations[q_idx],
+                    query_pose_emb=ep_pose_embs[q_idx],
+                    query_semantic_key=q_semantic_key,
+                    query_timestep=int(pt.query_frame),
+                    tier_config=args.tier_config,
+                    model=model,
+                    latents_per_frame=latents_per_frame,
+                    args=args,
+                    device=device,
+                )
+                if bank_kv is None:
+                    logger.warning(
+                        "ep=%s q=%d [%s]：bank 检索为空（无满足条件的记忆帧）→ "
+                        "本次 oracle 注入退化为不注入",
+                        ep_id, pt.query_frame, args.tier_config)
 
             _tmp_action = tempfile.mkdtemp(prefix=f"oracle_inj_{ep_id}_q{pt.query_frame}_")
             try:
                 video = _generate_for_point(
-                    wan_i2v, bank, oracle_kv, wrong_kv, pt, ep, base_img, args,
+                    wan_i2v, bank_kv, oracle_kv, wrong_kv, pt, ep, base_img, args,
                     device, rng, _tmp_action)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("生成失败 ep=%s q=%d: %s", ep_id, pt.query_frame, exc)
@@ -749,6 +1046,12 @@ def main():
             })
 
         del frames, latents_per_frame
+        if ep_pose_embs is not None:
+            del ep_pose_embs
+        if ep_visual_embs is not None:
+            del ep_visual_embs
+        if ep_abs_translations is not None:
+            del ep_abs_translations
         torch.cuda.empty_cache()
 
     _write_summary(args, all_records)
@@ -786,16 +1089,19 @@ def _pick_wrong_indices(pt: RevisitPoint, n: int, T: int,
 
 
 def _build_bank_for_config(args):
-    """按 tier_config 构建 ThreeTierMemoryBank（关掉的层 cap=0）。
+    """按 tier_config 构建 ThreeTierMemoryBank。
 
-    - full        : Short/Medium/Long 全保留
-    - medium_long : Short cap=0（关 Short），Medium/Long 保留
+    - full        : Short/Medium/Long 全保留，检索时三层都取
+    - medium_long : Short 仍 populate（cap=1）但**检索时不取 Short**（_retrieve_bank_kv
+                    仅在 tier_config=="full" 时读 Short），等价"关 Short"
     （oracle_only 不构建 bank，main 中传 None）
 
-    注：cap=0 时该层 update 不写入、retrieve 返回空，等价"关层"。
+    注：Short cap 固定为 1（不用 cap=0）——ShortTermBank(cap=0).update() 会在空队列上
+    pop(0) 抛 IndexError，且 ThreeTierMemoryBank.update 先调 short.update，会连带阻断
+    Medium/Long 写入。"关 Short" 改由检索侧 tier 选择实现，更安全且不动 memory_bank.py。
     """
     from memory_module.memory_bank import ThreeTierMemoryBank
-    short_cap = 1 if args.tier_config == "full" else 0
+    short_cap = 1
     return ThreeTierMemoryBank(
         short_cap=short_cap,
         medium_cap=args.medium_cap,
