@@ -1628,9 +1628,9 @@ def parse_args() -> argparse.Namespace:
 
     # ---- v4 新增：训练阶段选择（exp / full 数据集）----
     parser.add_argument("--phase", type=str, default="exp",
-                        choices=["exp", "full"],
-                        help="训练阶段：exp（ep01-11，小规模验证）/ full（ep01-46，全量训练）；"
-                             "决定 CSV 路径：metadata_{phase}_{split}.csv")
+                        choices=["exp", "full", "verify"],
+                        help="训练阶段：exp（ep01-11，小规模验证）/ full（ep01-46，全量训练）/ "
+                             "verify（revisit 验证集，50ep）；决定 CSV 路径：metadata_{phase}_{split}.csv")
 
     # ---- v4 新增：随机 N-clip 训练参数（Innovation 6）----
     # 注：v3 的 --num_context_clips 已移除，替换为 --max_context_clips
