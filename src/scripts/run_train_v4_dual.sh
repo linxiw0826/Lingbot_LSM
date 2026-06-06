@@ -65,7 +65,10 @@ HYBRID_MEDIUM_K=3          # 混合检索预算中 Medium 层 top-K
 HYBRID_LONG_K=2            # 混合检索预算中 Long 层 top-K
 DUP_THRESHOLD=0.95         # cross-tier dedup 阈值（pose_emb cosine_sim > 阈值则去重）
 
-CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5}"
+# 固定使用 0-5 共 6 卡（ZeRO-3 需 6 卡分摊 22.7B 参数）。
+# 写死而非 ${VAR:-...} 默认值：避免 shell 里残留的 CUDA_VISIBLE_DEVICES（如单卡）覆盖掉。
+# 如需改卡，直接编辑下面这行。
+CUDA_VISIBLE_DEVICES="0,1,2,3,4,5"
 
 # ============================================================
 # 以下内容通常无需修改
