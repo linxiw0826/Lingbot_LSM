@@ -13,8 +13,7 @@ deepspeed_config:
   reduce_scatter: true
   reduce_bucket_size: 2e8
   contiguous_gradients: true
-  offload_optimizer_device: cpu
-  offload_optimizer_pin_memory: true
+  offload_optimizer_device: none
   offload_param_device: none
   zero3_init_flag: false
   zero3_save_16bit_model: true
