@@ -36,11 +36,11 @@ LORA_TARGET_MODULES=""     # LoRA目标模块（留空自动检测）
 
 NUM_EPOCHS="${NUM_EPOCHS:-3}"        # 验证阶段：3 epoch 足够看 gate 学习 + revisit loss 趋势
 TRAIN_HIGH="${TRAIN_HIGH:-0}"        # 0=只训 low（验证机制只需一个模型，省一半时间）；1=low+high
-LEARNING_RATE=5e-4               # 验证：1e-4→5e-4，让 gate 更快移动（B）
+LEARNING_RATE=1e-4               # 回退：5e-4 顶发散，回稳定 1e-4
 LR_DIT=1e-5
 WEIGHT_DECAY=0.01
-GRADIENT_ACCUMULATION_STEPS=1    # 验证：8→1，更新次数×8（135/epoch），零额外计算（A）
-MAX_GRAD_NORM=5.0                # 验证：1.0→5.0，放宽裁剪（grad_norm~30 不再被砍 30 倍）（C）
+GRADIENT_ACCUMULATION_STEPS=1    # 保留：8→1，更新次数×8（唯一安全的加速器，零额外计算）
+MAX_GRAD_NORM=1.0                # 回退：5.0 撤防致 attn_norm 爆 40985，回 1.0 保护
 SAVE_EVERY_N_EPOCHS=1
 KEEP_LAST_N_CHECKPOINTS=2     # 只保留最近 2 个 checkpoint，第 3 个存下来时自动删第 1 个
 DATASET_REPEAT=1
