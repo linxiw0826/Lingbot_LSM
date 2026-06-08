@@ -204,6 +204,13 @@ def _parse_args():
     p.add_argument("--visual_fusion_alpha", type=float, default=0.7)
     p.add_argument("--retrieve_topk", type=int, default=6,
                    help="memory_ON 每窗口注入的检索帧数上限（与训练 retrieve 预算 6 对齐）")
+    p.add_argument("--gate_override", type=float, default=None,
+                   help="诊断用途（默认 None=用 checkpoint 学到的 gate，100%% 保持原行为）。"
+                        "设了值（如 0.5）则在 memory_ON 前向时把所有 block 的 "
+                        "memory_cross_attn.gate 临时覆盖成该值（forward 后还原，绝不写回 checkpoint），"
+                        "用于在同一 checkpoint、零额外训练下测「如果 gate 开得更大，检索来的记忆"
+                        "到底帮不帮得上」——把「gate 学没学会打开」与「模型能不能用记忆」解耦。"
+                        "OFF 档（memory_states=None）本就旁路 gate，不受影响。")
 
     # ---- loss / 前向参数（与 train_v4 对齐）----
     p.add_argument("--nfp_loss_weight", type=float, default=0.1,
@@ -553,6 +560,49 @@ def _retrieve_revisit_kv(
 
 
 # ---------------------------------------------------------------------------
+# gate_override：诊断用途——临时强制所有 block 的 memory_cross_attn.gate
+# （forward 后还原，绝不写回 checkpoint），把「gate 学没学会打开」和「模型能不能
+#  用记忆」解耦。仅作用于 memory_ON 前向；OFF 档 memory_states=None 本就旁路 gate。
+# ---------------------------------------------------------------------------
+
+from contextlib import contextmanager
+
+
+@contextmanager
+def _gate_override_ctx(model, gate_value: Optional[float]):
+    """临时把所有 MemoryBlockWrapper.memory_cross_attn.gate 覆盖成 gate_value，
+    退出时无条件还原原值（用 no_grad + 保存/还原 .data，绝不持久写回 checkpoint）。
+
+    gate_value=None → 完全不动 gate（默认，100% 保持现有行为，向后兼容）。
+
+    注意：仅在 memory_ON 前向时进入本上下文；OFF 档（memory_states=None）本就旁路
+    memory_cross_attn（MemoryBlockWrapper.forward 仅在 dit_cond_dict 含
+    _MEMORY_STATES_KEY 时才走 cross-attn），无需也不受 gate 影响。
+    """
+    if gate_value is None:
+        # 默认路径：不触碰任何 gate，零副作用
+        yield
+        return
+
+    saved: List[Tuple[torch.Tensor, torch.Tensor]] = []
+    try:
+        with torch.no_grad():
+            for blk in getattr(model, "blocks", []):
+                ca = getattr(blk, "memory_cross_attn", None)
+                g = getattr(ca, "gate", None) if ca is not None else None
+                if g is None:
+                    continue
+                saved.append((g, g.data.clone()))
+                g.data.fill_(float(gate_value))
+        yield
+    finally:
+        # 无条件还原（即使前向抛异常也不污染后续 window / OFF 档）
+        with torch.no_grad():
+            for g, orig in saved:
+                g.data.copy_(orig)
+
+
+# ---------------------------------------------------------------------------
 # 单窗口前向 loss（memory_ON / memory_OFF 共用；唯一差异 = 是否注入 K/V）
 # ---------------------------------------------------------------------------
 
@@ -640,7 +690,12 @@ def _forward_loss_one_condition(
     diff_vals: List[float] = []
     nfp_vals: List[float] = []
 
-    for (sigma, t, training_weight, noise) in timestep_samples:
+    # gate_override 仅作用于 memory_ON（bank_kv 非 None）；OFF 档（bank_kv=None）
+    # 不注入 memory_states，cross-attn 旁路，传 None 让 ctx 为 no-op。
+    _gate_for_ctx = args.gate_override if bank_kv is not None else None
+
+    with _gate_override_ctx(model, _gate_for_ctx):
+      for (sigma, t, training_weight, noise) in timestep_samples:
         noise = noise.to(device=video_latent.device, dtype=video_latent.dtype)
         noisy_latent = (1.0 - sigma) * video_latent + sigma * noise
         target = noise - video_latent
@@ -826,10 +881,21 @@ def _pct_delta(on: float, off: float) -> float:
     return (off - on) / abs(off) * 100.0
 
 
+def _gate_source_str(args) -> str:
+    """本次评测 memory_ON 用的 gate 来源标注：
+      'learned'         → 默认，用 checkpoint 学到的 gate（向后兼容路径）。
+      'override=<值>'    → --gate_override 设了值，memory_ON 前向强制 gate=<值>。
+    """
+    if args.gate_override is None:
+        return "learned"
+    return f"override={args.gate_override:g}"
+
+
 def _write_outputs(args, records: List[Dict], gate_mean: float,
                    csv_has_revisit: bool) -> None:
     """写 per_window.csv + summary.json + summary.md。"""
     os.makedirs(args.output_dir, exist_ok=True)
+    gate_source = _gate_source_str(args)
 
     # ---- per-window CSV ----
     csv_path = os.path.join(args.output_dir, "per_window.csv")
@@ -864,24 +930,40 @@ def _write_outputs(args, records: List[Dict], gate_mean: float,
         }
 
     # 判据：diffusion_loss ON 显著低于 OFF（Δ% > 0 且有实质幅度）
+    # 文案随 gate 来源调整：override 下是「在强制 gate 下 ON vs OFF」（测模型能否用记忆），
+    # learned 下是「用 checkpoint 学到的 gate 下 ON vs OFF」。
+    _is_override = args.gate_override is not None
+    _gate_clause = (f"在强制 gate={args.gate_override:g} 下"
+                    if _is_override else "在 checkpoint 学到的 gate 下")
     d = agg["diffusion"]
     if not np.isfinite(d["delta_pct"]):
         verdict = "无法判定（无有效样本）"
     elif d["delta_pct"] > 1.0:
-        verdict = (f"memory_ON diffusion_loss 比 OFF 低 {d['delta_pct']:.2f}% "
-                   f"→ 初步信号：记忆有用（仍需结合 gate 数值 + 生成质量确认）")
+        verdict = (f"{_gate_clause} memory_ON diffusion_loss 比 OFF 低 {d['delta_pct']:.2f}% "
+                   + ("→ 模型能用记忆（能力没问题），只差 gate 学会打开（见降级说明 4）"
+                      if _is_override else
+                      "→ 初步信号：记忆有用（仍需结合 gate 数值 + 生成质量确认）"))
     elif d["delta_pct"] < -1.0:
-        verdict = (f"memory_ON diffusion_loss 比 OFF 高 {-d['delta_pct']:.2f}% "
+        verdict = (f"{_gate_clause} memory_ON diffusion_loss 比 OFF 高 {-d['delta_pct']:.2f}% "
                    f"→ 注入记忆反而抬高 loss（疑为 non-functional memory 加结构化噪声，见 OP-1）")
     else:
-        verdict = (f"memory_ON ≈ memory_OFF（Δ={d['delta_pct']:.2f}%）"
-                   f"→ ⚠️ 不能据此判「记忆无用」：须先排除训练不足"
-                   f"（gate_mean={gate_mean:.4f}，若 ≈0.1 说明 gate 没打开），多训几 epoch 再测")
+        if _is_override:
+            verdict = (f"{_gate_clause} memory_ON ≈ memory_OFF（Δ={d['delta_pct']:.2f}%）"
+                       f"→ 强制 gate 下记忆仍无明显帮助，倾向「模型尚不能用记忆」"
+                       f"（已排除 gate 没打开这一因素），需排查检索/注入或继续训练")
+        else:
+            verdict = (f"{_gate_clause} memory_ON ≈ memory_OFF（Δ={d['delta_pct']:.2f}%）"
+                       f"→ ⚠️ 不能据此判「记忆无用」：须先排除训练不足"
+                       f"（gate_mean={gate_mean:.4f}，若 ≈0.1 说明 gate 没打开），"
+                       f"可加 --gate_override 0.5 复测以解耦「gate 没打开」与「模型能否用记忆」，"
+                       f"或多训几 epoch 再测")
 
     summary = {
         "timestamp": datetime.now().isoformat(),
         "args": vars(args),
         "gate_mean": gate_mean,
+        "gate_source": gate_source,          # 'learned' 或 'override=<值>'
+        "gate_override": args.gate_override,  # None 或 float
         "csv_has_revisit_column": csv_has_revisit,
         "n_windows": len(records),
         "aggregate": agg,
@@ -914,14 +996,25 @@ def _write_outputs(args, records: List[Dict], gate_mean: float,
         "**多训几 epoch 再测**（沿用 current_focus 阶段三十五/三十六关键陷阱，避免重蹈 F-12："
         "用 non-functional memory 的结果否定 idea）。\n"
     )
+    md.append(
+        f"5. **gate 来源：`{gate_source}`**。`--gate_override` 是**诊断用途**——强制 gate "
+        "测「**模型能否用记忆**」，与「**训练后 gate 是否自然打开**」是两个问题。"
+        "本次为 "
+        + ("`override`：在同一 checkpoint、零额外训练下强制 gate 测「模型能否用记忆」。"
+           "**override 下 ON < OFF 说明能力没问题、只差 gate 学会打开**"
+           if args.gate_override is not None else
+           "`learned`：用 checkpoint 学到的 gate（默认，未强制覆盖）。"
+           "若此处 ON≈OFF 且 gate_mean≈0.1，建议加 `--gate_override 0.5` 复测以解耦上述两个问题")
+        + "。\n"
+    )
     if not args.ft_model_dir:
         md.append(
-            "5. **未提供 --ft_model_dir**：memory_cross_attn 为随机初始化 → "
+            "6. **未提供 --ft_model_dir**：memory_cross_attn 为随机初始化 → "
             "本次结果**仅作负对照**，不能据此肯定/否定 idea。\n"
         )
     if not csv_has_revisit:
         md.append(
-            "6. **CSV 无 is_revisit 列**：评测窗口由 compute_gt_revisit 在 episode 内"
+            "7. **CSV 无 is_revisit 列**：评测窗口由 compute_gt_revisit 在 episode 内"
             "判定（与 retrieval_probe 同口径），gap 为按帧数近似，非 CSV 标注值。\n"
         )
     md.append("\n")
@@ -933,8 +1026,12 @@ def _write_outputs(args, records: List[Dict], gate_mean: float,
     md.append(f"- metadata: {args.metadata}\n")
     md.append(f"- revisit_only: {args.revisit_only} | gap∈[{args.gap_lo},{args.gap_hi}]\n")
     md.append(f"- retrieve path: retrieve_revisit (Long tier, abs-pos L2 + 排近邻; [[F-14]])\n")
+    md.append(f"- gate 来源: {gate_source}"
+              + (f"（memory_ON 前向强制 gate={args.gate_override:g}，forward 后还原，"
+                 f"不写回 checkpoint）" if args.gate_override is not None
+                 else "（用 checkpoint 学到的 gate）") + "\n")
     md.append(f"- num_loss_samples: {args.num_loss_samples} | "
-              f"gate_mean: {gate_mean:.4f}\n\n")
+              f"gate_mean(learned): {gate_mean:.4f}\n\n")
 
     md.append("## Aggregate（memory_ON vs memory_OFF，全窗口均值）\n\n")
     md.append("| 指标 | ON | OFF | Δ(OFF-ON) | Δ% | n |\n")
@@ -1024,6 +1121,22 @@ def main():
     logger.info("Loading trainer + model (train_v4 LingBotMemoryTrainer)...")
     trainer, model = _build_trainer_and_model(args, device)
     gate_mean = _log_memory_weight_sanity(model)
+
+    # sanity log：本次 memory_ON 实际生效的 gate（确认 --gate_override 是否生效）。
+    # override 时打印强制值；默认（None）时打印实测 learned gate_mean，行为完全不变。
+    if args.gate_override is not None:
+        logger.info(
+            "gate source = override：memory_ON 前向将强制所有 block 的 "
+            "memory_cross_attn.gate = %.4f（forward 后还原，不写回 checkpoint；"
+            "OFF 档不受影响）。诊断目的：把「gate 学没学会打开」与「模型能否用记忆」解耦。",
+            args.gate_override,
+        )
+    else:
+        logger.info(
+            "gate source = learned：用 checkpoint 学到的 gate（实测 gate_mean=%.4f，"
+            "未做覆盖，100%% 保持原行为）。",
+            gate_mean,
+        )
 
     rng_seed_base = args.seed
     all_records: List[Dict] = []
