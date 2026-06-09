@@ -65,6 +65,7 @@ Short 用 short.retrieve_all），把检索帧构造成 memory K/V 注入。检�
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import logging
 import os
@@ -679,7 +680,21 @@ def _revisit_consistency(
     同时返回 mean / last 供诊断。
     """
     F_ = gen_video.shape[1]
-    gt_gray = _to_gray_uint8(gt_first_visit_frame)
+    gt_gray = _to_gray_uint8(gt_first_visit_frame)  # [H_gt,W_gt] float32 [0,255]
+
+    # P0 修复：WanI2V.generate() 内部会把请求的 H（如 480）调整为 patch/VAE 整除的
+    # 实际输出高度（如 464），而 GT 首访帧按 --size（480×832）加载，两者 H 不一致会让
+    # _ssim 逐元素相乘 broadcast 失败。这里以 gen 输出为准（它才是模型真实输出分辨率），
+    # 把 GT 灰度帧 resize 到 gen 帧的 (H_gen,W_gen)。gen 各帧 H,W 相同，故循环外只 resize 一次。
+    if F_ > 0:
+        h_gen, w_gen = gen_video.shape[2], gen_video.shape[3]
+        if gt_gray.shape != (h_gen, w_gen):
+            # 灰度是 float32 [0,255]：用 mode='F'（32-bit float）Image 双线性 resize，
+            # 避免 uint8 量化损失。PIL resize 的 size 参数顺序为 (W,H)。
+            gt_img = Image.fromarray(gt_gray, mode="F")
+            gt_img = gt_img.resize((w_gen, h_gen), resample=Image.BILINEAR)
+            gt_gray = np.asarray(gt_img, dtype=np.float32)
+
     ssims = []
     for t in range(F_):
         ssims.append(_ssim(_to_gray_uint8(gen_video[:, t]), gt_gray))
@@ -689,6 +704,44 @@ def _revisit_consistency(
         "revisit_consistency_mean": float(ssims_np.mean()) if F_ > 0 else 0.0,
         "revisit_consistency_last": float(ssims_np[-1]) if F_ > 0 else 0.0,
     }
+
+
+def _record_point(
+    all_records: List[Dict],
+    args,
+    ep_id: str,
+    ep_out_dir: str,
+    point: "RevisitPoint",
+    video: np.ndarray,
+    gt_first: np.ndarray,
+    n_oracle_frames: int,
+    mp4_path: str,
+) -> None:
+    """算指标 + 构造 record + append all_records + 增量写 per_window.csv（P1）。
+
+    生成路径与 mp4 读回路径（P2）共用本函数，保证两条路径的 record 字段一致。
+    n_oracle_frames=-1 表示该点来自 mp4 读回（未重算 oracle 帧），仅作标记。
+    """
+    metrics = _revisit_consistency(video, gt_first)
+    logger.info("ep=%s q=%d [%s/%s] %s",
+                ep_id, point.query_frame, args.tier_config,
+                args.memory_mode, metrics)
+    record = {
+        "episode_id": ep_id,
+        "query_frame": point.query_frame,
+        "first_visit_frame": point.first_visit_frame,
+        "tier_config": args.tier_config,
+        "memory_mode": args.memory_mode,
+        "weaken_first_frame": args.weaken_first_frame,
+        "n_oracle_frames": n_oracle_frames,
+        "video_path": mp4_path,
+        "gt_first_visit_png": os.path.join(
+            ep_out_dir, f"q{point.query_frame}_gt_first_visit.png"),
+        **metrics,
+    }
+    all_records.append(record)
+    # P1：逐点增量落盘，中途崩溃已完成点不丢失
+    _append_per_window_csv(args.output_dir, record)
 
 
 # ---------------------------------------------------------------------------
@@ -947,103 +1000,113 @@ def main():
         os.makedirs(ep_out_dir, exist_ok=True)
 
         for pt in points:
-            # 首访 GT 帧（一致性参照 + 人工定性对比）
-            gt_first = frames[pt.first_visit_frame]  # [3,H,W]
-            # 保存首访 GT 帧供人工对比
-            _save_frame_png(gt_first,
-                            os.path.join(ep_out_dir,
-                                         f"q{pt.query_frame}_gt_first_visit.png"))
-
-            # query clip 首帧 GT 图像（弱化前的 base，作为 generate 的 img 入口）
-            _pc, _ac, _ic, seg_start = _frame_to_clip_slice(
-                ep, pt.query_frame, args.frame_num)
-            query_first_np = frames[seg_start]  # [3,H,W]
-            base_img = _frame_to_pil(query_first_np)
-
-            # 构造 oracle K/V（绕过 bank）：注入首访点附近的 GT 历史帧
-            oracle_indices = _pick_oracle_indices(pt, args.num_oracle_frames, T)
-            oracle_kv = _build_oracle_memory_kv(
-                model, wan_i2v, ep, latents_per_frame, oracle_indices, device)
-            # wrong K/V：同 episode 远距离位置的 GT 帧
-            wrong_indices = _pick_wrong_indices(pt, args.num_oracle_frames, T, rng)
-            wrong_kv = _build_oracle_memory_kv(
-                model, wan_i2v, ep, latents_per_frame, wrong_indices, device)
-
-            # full / medium_long + oracle 档：构建 bank → populate [0, query_clip_start)
-            # → 从启用的 tier 检索 → 构造注入 K/V（bank_kv）。oracle_only / off / wrong 路径不走此处。
-            bank_kv = None
-            if need_bank and ep_pose_embs is not None:
-                bank = _build_bank_for_config(args)
-                # query clip 起始帧（与 _generate_for_point 内 _frame_to_clip_slice 对齐）
-                _qpc, _qac, _qic, q_clip_start = _frame_to_clip_slice(
-                    ep, pt.query_frame, args.frame_num)
-                _populate_bank(
-                    bank, ep, q_clip_start,
-                    ep_pose_embs, ep_visual_embs, ep_surprise,
-                    latents_per_frame, ep_abs_translations, args,
-                )
-                # query 侧逐帧量（location / pose_emb / semantic_key），口径同 populate
-                q_idx = min(max(pt.query_frame, 0), T - 1)
-                q_visual = ep_visual_embs[q_idx] if ep_visual_embs is not None else None
-                q_semantic_key = _semantic_key_for_frame(
-                    ep_pose_embs[q_idx], q_visual, args.visual_fusion_alpha)
-                bank_kv = _retrieve_bank_kv(
-                    bank,
-                    query_location=ep_abs_translations[q_idx],
-                    query_pose_emb=ep_pose_embs[q_idx],
-                    query_semantic_key=q_semantic_key,
-                    query_timestep=int(pt.query_frame),
-                    tier_config=args.tier_config,
-                    model=model,
-                    latents_per_frame=latents_per_frame,
-                    args=args,
-                    device=device,
-                )
-                if bank_kv is None:
-                    logger.warning(
-                        "ep=%s q=%d [%s]：bank 检索为空（无满足条件的记忆帧）→ "
-                        "本次 oracle 注入退化为不注入",
-                        ep_id, pt.query_frame, args.tier_config)
-
-            _tmp_action = tempfile.mkdtemp(prefix=f"oracle_inj_{ep_id}_q{pt.query_frame}_")
+            # P1 抗崩：单个重访点整段（生成→保存→算指标→append record）包 try/except，
+            # 单点失败只 logger.exception + continue，不让整轮（可能 8h）崩掉。
             try:
-                video = _generate_for_point(
-                    wan_i2v, bank_kv, oracle_kv, wrong_kv, pt, ep, base_img, args,
-                    device, rng, _tmp_action)
+                # 首访 GT 帧（一致性参照 + 人工定性对比）
+                gt_first = frames[pt.first_visit_frame]  # [3,H,W]
+                # 保存首访 GT 帧供人工对比
+                _save_frame_png(gt_first,
+                                os.path.join(ep_out_dir,
+                                             f"q{pt.query_frame}_gt_first_visit.png"))
+
+                mp4_name = f"q{pt.query_frame}_{args.tier_config}_{args.memory_mode}.mp4"
+                mp4_path = os.path.join(ep_out_dir, mp4_name)
+
+                # P2 可续/止损：该点目标 mp4 已存在 → 不重跑 generate（省 ~49min），
+                # 从 mp4 读回视频帧照常算指标。此分支不重算 oracle_indices
+                # （record 里 n_oracle_frames 标 -1 表示"来自读回，未重算"）。
+                oracle_indices: List[int] = []
+                if os.path.exists(mp4_path):
+                    video = _read_video_back(mp4_path)
+                    if video is not None:
+                        logger.info(
+                            "ep=%s q=%d [%s/%s]：mp4 已存在 → 读回重算指标（跳过生成）",
+                            ep_id, pt.query_frame, args.tier_config, args.memory_mode)
+                        _record_point(
+                            all_records, args, ep_id, ep_out_dir, pt, video,
+                            gt_first, n_oracle_frames=-1, mp4_path=mp4_path)
+                        continue
+                    logger.warning(
+                        "ep=%s q=%d：mp4 存在但读回失败 → 重新生成", ep_id, pt.query_frame)
+
+                # query clip 首帧 GT 图像（弱化前的 base，作为 generate 的 img 入口）
+                _pc, _ac, _ic, seg_start = _frame_to_clip_slice(
+                    ep, pt.query_frame, args.frame_num)
+                query_first_np = frames[seg_start]  # [3,H,W]
+                base_img = _frame_to_pil(query_first_np)
+
+                # 构造 oracle K/V（绕过 bank）：注入首访点附近的 GT 历史帧
+                oracle_indices = _pick_oracle_indices(pt, args.num_oracle_frames, T)
+                oracle_kv = _build_oracle_memory_kv(
+                    model, wan_i2v, ep, latents_per_frame, oracle_indices, device)
+                # wrong K/V：同 episode 远距离位置的 GT 帧
+                wrong_indices = _pick_wrong_indices(pt, args.num_oracle_frames, T, rng)
+                wrong_kv = _build_oracle_memory_kv(
+                    model, wan_i2v, ep, latents_per_frame, wrong_indices, device)
+
+                # full / medium_long + oracle 档：构建 bank → populate [0, query_clip_start)
+                # → 从启用的 tier 检索 → 构造注入 K/V（bank_kv）。oracle_only / off / wrong 路径不走此处。
+                bank_kv = None
+                if need_bank and ep_pose_embs is not None:
+                    bank = _build_bank_for_config(args)
+                    # query clip 起始帧（与 _generate_for_point 内 _frame_to_clip_slice 对齐）
+                    _qpc, _qac, _qic, q_clip_start = _frame_to_clip_slice(
+                        ep, pt.query_frame, args.frame_num)
+                    _populate_bank(
+                        bank, ep, q_clip_start,
+                        ep_pose_embs, ep_visual_embs, ep_surprise,
+                        latents_per_frame, ep_abs_translations, args,
+                    )
+                    # query 侧逐帧量（location / pose_emb / semantic_key），口径同 populate
+                    q_idx = min(max(pt.query_frame, 0), T - 1)
+                    q_visual = ep_visual_embs[q_idx] if ep_visual_embs is not None else None
+                    q_semantic_key = _semantic_key_for_frame(
+                        ep_pose_embs[q_idx], q_visual, args.visual_fusion_alpha)
+                    bank_kv = _retrieve_bank_kv(
+                        bank,
+                        query_location=ep_abs_translations[q_idx],
+                        query_pose_emb=ep_pose_embs[q_idx],
+                        query_semantic_key=q_semantic_key,
+                        query_timestep=int(pt.query_frame),
+                        tier_config=args.tier_config,
+                        model=model,
+                        latents_per_frame=latents_per_frame,
+                        args=args,
+                        device=device,
+                    )
+                    if bank_kv is None:
+                        logger.warning(
+                            "ep=%s q=%d [%s]：bank 检索为空（无满足条件的记忆帧）→ "
+                            "本次 oracle 注入退化为不注入",
+                            ep_id, pt.query_frame, args.tier_config)
+
+                _tmp_action = tempfile.mkdtemp(
+                    prefix=f"oracle_inj_{ep_id}_q{pt.query_frame}_")
+                try:
+                    video = _generate_for_point(
+                        wan_i2v, bank_kv, oracle_kv, wrong_kv, pt, ep, base_img, args,
+                        device, rng, _tmp_action)
+                finally:
+                    import shutil
+                    shutil.rmtree(_tmp_action, ignore_errors=True)
+
+                if video is None:
+                    logger.warning("ep=%s q=%d：生成返回 None，跳过该点",
+                                   ep_id, pt.query_frame)
+                    continue
+
+                # 保存生成视频
+                _save_video(video, mp4_path, fps=args.fps)
+
+                _record_point(
+                    all_records, args, ep_id, ep_out_dir, pt, video,
+                    gt_first, n_oracle_frames=len(oracle_indices), mp4_path=mp4_path)
             except Exception as exc:  # noqa: BLE001
-                logger.exception("生成失败 ep=%s q=%d: %s", ep_id, pt.query_frame, exc)
-                video = None
-            finally:
-                import shutil
-                shutil.rmtree(_tmp_action, ignore_errors=True)
-
-            if video is None:
+                # P1：单点任何环节失败 → 记录并继续下一个点，不中断整轮
+                logger.exception("重访点处理失败 ep=%s q=%d: %s",
+                                 ep_id, pt.query_frame, exc)
                 continue
-
-            # 保存生成视频
-            mp4_name = f"q{pt.query_frame}_{args.tier_config}_{args.memory_mode}.mp4"
-            mp4_path = os.path.join(ep_out_dir, mp4_name)
-            _save_video(video, mp4_path, fps=args.fps)
-
-            # 一致性指标
-            metrics = _revisit_consistency(video, gt_first)
-            logger.info("ep=%s q=%d [%s/%s] %s",
-                        ep_id, pt.query_frame, args.tier_config,
-                        args.memory_mode, metrics)
-
-            all_records.append({
-                "episode_id": ep_id,
-                "query_frame": pt.query_frame,
-                "first_visit_frame": pt.first_visit_frame,
-                "tier_config": args.tier_config,
-                "memory_mode": args.memory_mode,
-                "weaken_first_frame": args.weaken_first_frame,
-                "n_oracle_frames": len(oracle_indices),
-                "video_path": mp4_path,
-                "gt_first_visit_png": os.path.join(
-                    ep_out_dir, f"q{pt.query_frame}_gt_first_visit.png"),
-                **metrics,
-            })
 
         del frames, latents_per_frame
         if ep_pose_embs is not None:
@@ -1129,6 +1192,41 @@ def _save_frame_png(frame_chw: np.ndarray, path: str) -> None:
     _frame_to_pil(frame_chw).save(path)
 
 
+def _read_video_back(path: str) -> Optional[np.ndarray]:
+    """读回已存在的 mp4 为 [3,F,H,W] float32 in [-1,1]（与生成路径值域一致）。
+
+    P2 可续/止损：该重访点 mp4 已存在时不重跑 generate（省 ~49min），改为从 mp4 读回
+    视频帧、照常算指标。用 cv2 顺序解码（cv2 已在依赖中，与 retrieval_probe._decode_episode_video
+    同栈）。⚠️ mp4 经 libx264 有损压缩，读回值与原始生成张量略有差异；本读回仅用于一致性
+    相对比较（oracle/off/wrong 同等受压缩影响），可接受此近似。
+
+    Returns:
+        [3,F,H,W] float32 in [-1,1]；读取失败或无帧时返回 None。
+    """
+    import cv2
+
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        logger.warning("读回 mp4 失败（无法打开）：%s", path)
+        return None
+    frames: List[np.ndarray] = []
+    try:
+        while True:
+            ok, bgr = cap.read()
+            if not ok or bgr is None:
+                break
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            # 归一到 [-1,1]，与生成路径（_save_video value_range=(-1,1)）值域一致
+            arr = rgb.astype(np.float32) / 127.5 - 1.0
+            frames.append(arr.transpose(2, 0, 1))  # [3,H,W]
+    finally:
+        cap.release()
+    if not frames:
+        logger.warning("读回 mp4 失败（无有效帧）：%s", path)
+        return None
+    return np.stack(frames, axis=1)  # [3,F,H,W]
+
+
 def _save_video(video: np.ndarray, path: str, fps: int) -> None:
     """保存 [3,F,H,W] in [-1,1] 视频，复用 wan.utils.save_video。"""
     from wan.utils.utils import save_video
@@ -1147,6 +1245,25 @@ def _save_video(video: np.ndarray, path: str, fps: int) -> None:
 # ---------------------------------------------------------------------------
 # Summary 输出
 # ---------------------------------------------------------------------------
+
+def _append_per_window_csv(output_dir: str, record: Dict) -> None:
+    """逐点增量写 per_window.csv（P1 抗崩：算完一个点立即 append 一行）。
+
+    这样长跑（可能 8h）中途崩溃时，已完成点的指标不丢失。首次写入 header，
+    之后续写。字段顺序以 record 的 key 为准（与 all_records 的 dict 一致）。
+    """
+    csv_path = os.path.join(output_dir, "per_window.csv")
+    file_exists = os.path.exists(csv_path)
+    try:
+        with open(csv_path, "a", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=list(record.keys()))
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(record)
+    except Exception as exc:  # noqa: BLE001
+        # 增量落盘失败不应影响主流程（指标已在内存 all_records 中，summary 仍会写）
+        logger.warning("写 per_window.csv 失败: %s", exc)
+
 
 def _write_summary(args, records: List[Dict]) -> None:
     """输出 summary.md（一致性数值表 + 视频路径）+ summary.json。"""
