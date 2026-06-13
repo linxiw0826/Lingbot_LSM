@@ -808,7 +808,12 @@ class LingBotMemoryTrainer:
         )
 
         logging.info("Converting to WanModelWithMemory...")
-        model = WanModelWithMemory.from_wan_model(base_wan_model)
+        # Exp2 spatial-V：透传 grid（None=帧级旧行为，向后兼容；8=patch 级）
+        _spatial_v_grid = getattr(self.args, "spatial_v_grid", None)
+        logging.info(f"spatial_v_grid = {_spatial_v_grid}")
+        model = WanModelWithMemory.from_wan_model(
+            base_wan_model, spatial_v_grid=_spatial_v_grid
+        )
         del base_wan_model
         gc.collect()
         model.train()
@@ -1160,8 +1165,11 @@ def multi_clip_training_step(
 
             if retrieved_ctx is not None:
                 key_states_ctx, value_states_ctx = retrieved_ctx
-                memory_states_ctx = key_states_ctx.unsqueeze(0)    # [1, K, 5120]
-                memory_value_states_ctx = value_states_ctx.unsqueeze(0)  # [1, K, 5120]
+                # Exp2 spatial-V：grid=None 时等价于 unsqueeze(0)；grid=g 时展开成 patch 级
+                # context 无 tier_ids，只取前两个返回值
+                memory_states_ctx, memory_value_states_ctx, _ = model.build_memory_kv(
+                    key_states_ctx, value_states_ctx, None
+                )  # [1, K', 5120], [1, K', 5120]
             else:
                 # 无 memory 时用 dummy（与 v3 training_step 对齐）
                 memory_states_ctx = torch.zeros(
@@ -1418,10 +1426,13 @@ def multi_clip_training_step(
         assert key_states.shape[0] <= 6, (
             f"retrieve() returned {key_states.shape[0]} > 6 frames"
         )
-        memory_states = key_states.unsqueeze(0)        # [1, K, 5120]
-        memory_value_states = value_states.unsqueeze(0)  # [1, K, 5120]
-        # Innovation 10: 注入 tier_ids 到 dit_cond_dict_target
-        dit_cond_dict_target[_TIER_IDS_KEY] = tier_ids  # [K] int64, CPU 也可（forward 内 .to(x.device)）
+        # Exp2 spatial-V：grid=None 时等价于 unsqueeze(0) 且 tier_ids 原样；
+        # grid=g 时 K/V 展开成 k*g*g token，tier 每帧 repeat_interleave(g*g)
+        memory_states, memory_value_states, tier_ids_out = model.build_memory_kv(
+            key_states, value_states, tier_ids
+        )  # [1, K', 5120], [1, K', 5120], [K']
+        # Innovation 10: 注入展开后的 tier_ids 到 dit_cond_dict_target
+        dit_cond_dict_target[_TIER_IDS_KEY] = tier_ids_out  # [K'] int64, CPU 也可（forward 内 .to(x.device)）
     else:
         # bank 为空（n_ctx=0 或 drop-off 清空全部），回退到 dummy，与 v3 对齐
         memory_states = torch.zeros(
@@ -1669,6 +1680,10 @@ def parse_args() -> argparse.Namespace:
                         help="LongTermBank 检索帧数（默认 2）")
     parser.add_argument("--dup_threshold", type=float, default=0.95,
                         help="Cross-tier dedup 阈值（pose_emb cosine_sim > 此值认为冗余，默认 0.95）")
+    parser.add_argument("--spatial_v_grid", type=int, default=None,
+                        help="Exp2 spatial-V grid 大小。None=帧级旧行为（V 为均值池化 [dim]，"
+                             "K/V 各 k 个 token）；8=8×8 patch 级（V 展开为 [k*64, dim]，"
+                             "K=pose 重复+patch_pos_emb，tier repeat_interleave）。")
 
     return parser.parse_args()
 
