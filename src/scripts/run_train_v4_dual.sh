@@ -26,7 +26,8 @@ CKPT_DIR="/home/nvme02/lingbot-world/models/lingbot-world-base-act"
 DATASET_DIR="${DATASET_DIR:-/home/nvme02/Memory-dataset/v4_dynamic_481e3d7795739da3}"            # v4 数据集目录（默认=revisit verify 集）
 PHASE="${PHASE:-verify}"                  # 训练阶段："verify"（50ep revisit 验证集）/"exp"/"full"
 OUTPUT_BASE="/home/nvme02/wlx/Memory/outputs"
-OUTPUT_DIR="${OUTPUT_BASE}/train/v4_stage1_dual"
+# 可用环境变量覆盖输出目录（Exp2 spatial-V 应指向新目录，避免覆盖 v4_stage1_dual 基线 ckpt）
+OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_BASE}/train/v4_stage1_dual}"
 # RESUME_FROM_LOW=""         # low 模型断点续训路径（留空从头开始）
 RESUME_FROM_LOW="${RESUME_FROM_LOW:-}"
 RESUME_FROM_HIGH="${RESUME_FROM_HIGH:-}"        # high 模型断点续训路径（留空从头开始）
@@ -48,6 +49,9 @@ NUM_FRAMES=81
 HEIGHT=480
 WIDTH=832
 NFP_LOSS_WEIGHT=0.1
+
+# ---- Exp2 spatial-V：grid 大小（空，None=帧级旧行为；8=8×8 patch 级）----
+SPATIAL_V_GRID="${SPATIAL_V_GRID:-}"
 
 # ---- v4 新增：Stochastic N-clip + Context Drop-off + Visual Feature Fusion ----
 MAX_CONTEXT_CLIPS=6        # v4 Stochastic N-clip 上限（N ~ Uniform(2, max_context_clips)）
@@ -149,6 +153,11 @@ if [ "${LORA_RANK}" -gt 0 ]; then
     fi
 fi
 
+# Exp2 spatial-V：仅当 SPATIAL_V_GRID 非空时透传（空=帧级旧行为，向后兼容）
+if [ -n "${SPATIAL_V_GRID}" ]; then
+    TRAIN_ARGS+=(--spatial_v_grid "${SPATIAL_V_GRID}")
+fi
+
 TRAIN_SCRIPT="${PROJECT_ROOT}/src/pipeline/train_v4_stage1_dual.py"
 
 echo "====================================================="
@@ -160,6 +169,7 @@ echo "  TRAIN_HIGH          : ${TRAIN_HIGH}  (0=只训 low)"
 echo "  MAX_CONTEXT_CLIPS   : ${MAX_CONTEXT_CLIPS}"
 echo "  CONTEXT_DROP_P_MAX  : ${CONTEXT_DROP_P_MAX}"
 echo "  VISUAL_FUSION_ALPHA : ${VISUAL_FUSION_ALPHA}"
+echo "  SPATIAL_V_GRID      : ${SPATIAL_V_GRID:-<none, 帧级旧行为>}"
 echo "  ThreeTierMemoryBank: short=${SHORT_CAP} medium=${MEDIUM_CAP} long=${LONG_CAP}"
 echo "  CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
 echo "  NUM_GPUS           : ${NUM_GPUS}"
