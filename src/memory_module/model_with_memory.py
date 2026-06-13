@@ -39,6 +39,33 @@ from wan.modules.model import WanModel, WanAttentionBlock, WanLayerNorm  # noqa:
 from .memory_attention import MemoryCrossAttention  # noqa: E402
 from .nfp_head import NFPHead  # noqa: E402
 
+
+def _build_2d_sincos_pos_emb(grid_size: int, dim: int) -> Tensor:
+    """构造固定（非学习）2D sin-cos 位置编码，形状 [grid_size*grid_size, dim]。
+
+    Exp2 spatial-V：用于给 K 的每个 patch 注入空间位置。
+    设计为 register_buffer（而非 nn.Parameter），因为 DeepSpeed ZeRO-3 会把
+    裸 nn.Parameter 分片到各 rank（在 module.forward 之外访问时 .data 为 size-0），
+    而 buffer 在所有 rank 上复制、永不分片，可在 build_memory_kv（forward 之前）
+    安全访问。固定 sin-cos 仍给每个 patch 唯一的 K（满足空间路由需求）。
+
+    行向量 [:dim/2] 编码 h（行），[dim/2:] 编码 w（列）。要求 dim % 4 == 0。
+    """
+    assert dim % 4 == 0, f"_build_2d_sincos_pos_emb 需要 dim 能被 4 整除，got {dim}"
+
+    def _1d(d: int, pos: Tensor) -> Tensor:
+        # d 为该轴输出维度（偶数）；pos: [M] → 返回 [M, d]
+        omega = torch.arange(d // 2, dtype=torch.float32) / (d / 2.0)
+        omega = 1.0 / (10000.0 ** omega)               # [d/2]
+        out = torch.einsum("m,k->mk", pos.reshape(-1), omega)  # [M, d/2]
+        return torch.cat([torch.sin(out), torch.cos(out)], dim=1)  # [M, d]
+
+    coords = torch.arange(grid_size, dtype=torch.float32)
+    grid_h, grid_w = torch.meshgrid(coords, coords, indexing="ij")  # 行=h, 列=w
+    emb_h = _1d(dim // 2, grid_h)   # [g*g, dim/2]
+    emb_w = _1d(dim // 2, grid_w)   # [g*g, dim/2]
+    return torch.cat([emb_h, emb_w], dim=1)  # [g*g, dim]
+
 logging.basicConfig(
     format='%(asctime)s | %(levelname)s | %(name)s | %(message)s',
     level=logging.INFO,
@@ -178,10 +205,16 @@ class WanModelWithMemory(WanModel):
         #   g    = 新 patch 行为（g×g 网格，每帧展开成 g*g 个 patch token）
         self.spatial_v_grid = spatial_v_grid
         if spatial_v_grid is not None:
-            # 可学习 2D 位置编码：零初始化，形状 [g*g, dim]
-            # 加在 K 的组装侧（每帧 pose_emb 重复 g*g 次 + patch_pos_emb），告知模型 patch 的空间位置
-            self.patch_pos_emb = nn.Parameter(
-                torch.zeros(spatial_v_grid * spatial_v_grid, self.dim)
+            # 固定 2D sin-cos 位置编码，形状 [g*g, dim]，加在 K 的组装侧
+            # （每帧 pose_emb 重复 g*g 次 + patch_pos_emb），告知模型 patch 的空间位置。
+            # 用 register_buffer（非 nn.Parameter）：ZeRO-3 会把裸 Parameter 分片，
+            # 而 build_memory_kv 在 forward 之前访问它，分片态下 .data 为 size-0 会崩；
+            # buffer 在各 rank 复制、永不分片，可安全访问。persistent=False：由 (g,dim)
+            # 完全确定，构造时重算，不写入 checkpoint（eval 端同样重算，保证一致）。
+            self.register_buffer(
+                "patch_pos_emb",
+                _build_2d_sincos_pos_emb(spatial_v_grid, self.dim),
+                persistent=False,
             )
 
         # 将指定 blocks 替换为 MemoryBlockWrapper
