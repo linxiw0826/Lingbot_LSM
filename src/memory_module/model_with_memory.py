@@ -161,6 +161,7 @@ class WanModelWithMemory(WanModel):
         *args,
         memory_layers: Optional[List[int]] = None,
         max_memory_size: int = 8,
+        spatial_v_grid: Optional[int] = None,
         **kwargs,
     ):
         # 先调用 WanModel.__init__，创建原始 blocks
@@ -171,6 +172,17 @@ class WanModelWithMemory(WanModel):
             memory_layers = list(range(len(self.blocks)))
         self._memory_layers = memory_layers
         self._max_memory_size = max_memory_size
+
+        # Exp2 spatial-V：memory token 从帧级（1 token/帧）升到 patch 级（g*g token/帧）
+        #   None = 旧行为（均值池化、帧级，所有现有诊断/v3 路径不变）
+        #   g    = 新 patch 行为（g×g 网格，每帧展开成 g*g 个 patch token）
+        self.spatial_v_grid = spatial_v_grid
+        if spatial_v_grid is not None:
+            # 可学习 2D 位置编码：零初始化，形状 [g*g, dim]
+            # 加在 K 的组装侧（每帧 pose_emb 重复 g*g 次 + patch_pos_emb），告知模型 patch 的空间位置
+            self.patch_pos_emb = nn.Parameter(
+                torch.zeros(spatial_v_grid * spatial_v_grid, self.dim)
+            )
 
         # 将指定 blocks 替换为 MemoryBlockWrapper
         for i in memory_layers:
@@ -259,17 +271,96 @@ class WanModelWithMemory(WanModel):
         MODIFIED: F-03/F5 fix, authorized by Orchestrator 2026-04-02
         用于计算 cross-attention 的 V（视觉内容），与 K（pose_emb）配合使用。
 
+        Exp2 spatial-V：当 self.spatial_v_grid 非 None，返回 patch 级 visual emb
+        [g*g, dim]（保留空间布局），否则保持帧级 [dim]（均值池化、旧行为）。
+
         Args:
             latent: [z_dim=16, lat_h, lat_w]  单帧 VAE latent（无 batch 维度）
 
         Returns:
-            visual_emb: [dim=5120]  VAE latent 投影到模型空间的视觉嵌入
+            visual_emb:
+              spatial_v_grid is None → [dim=5120]（帧级，均值池化）
+              spatial_v_grid = g     → [g*g, dim=5120]（patch 级，g×g 网格）
         """
-        # 空间均值池化：[z_dim, lat_h, lat_w] → [z_dim]
-        # Cast to match latent_proj weight dtype (e.g. bfloat16) to avoid dtype mismatch
-        feat = latent.to(self.latent_proj.weight.dtype).mean(dim=[-2, -1])  # [z_dim=16]
-        # 线性投影：[z_dim=16] → [dim=5120]
-        return self.latent_proj(feat)  # [dim=5120]
+        latent = latent.to(self.latent_proj.weight.dtype)
+        if self.spatial_v_grid is None:
+            # 旧路径：空间均值池化 [z_dim, lat_h, lat_w] → [z_dim] → [dim]
+            feat = latent.mean(dim=[-2, -1])  # [z_dim=16]
+            return self.latent_proj(feat)  # [dim=5120]
+
+        # 新路径：自适应池化到 g×g 网格，逐 patch 套用 latent_proj（复用旧权重，不改 shape）
+        g = self.spatial_v_grid
+        pooled = torch_F.adaptive_avg_pool2d(latent[None], (g, g))[0]  # [z_dim, g, g]
+        patches = pooled.reshape(pooled.shape[0], g * g).transpose(0, 1)  # [g*g, z_dim]
+        return self.latent_proj(patches)  # [g*g, dim=5120]
+
+    def build_memory_kv(
+        self,
+        pose_embs: Tensor,
+        visual_embs: Tensor,
+        tier_ids: Optional[Tensor] = None,
+    ):
+        """Exp2 spatial-V：把 retrieve 出的帧级 (pose_embs, visual_embs, tier_ids)
+        组装成送入 cross-attn 的 (memory_states K, memory_value_states V, tier_ids)，
+        均带 batch 维度 [1, K', dim]（K' 与 tier_ids 长度一致）。
+
+        不变量：K/V token 数必须一致。
+
+        - spatial_v_grid is None（旧路径）：
+            K = pose_embs [k, dim] → [1, k, dim]
+            V = visual_embs [k, dim] → [1, k, dim]
+            tier_ids 原样（[k] 或 None）
+          与现有 pipeline 的 unsqueeze(0) 行为完全等价（向后兼容）。
+
+        - spatial_v_grid = g（新路径），要求 visual_embs 为 [k, g*g, dim]：
+            V = visual_embs 展平成 [k*g*g, dim] → [1, k*g*g, dim]
+            K = 每帧 pose_emb 重复 g*g 次 + patch_pos_emb[g*g, dim]，
+                堆叠成 [k*g*g, dim] → [1, k*g*g, dim]
+            tier_ids 每帧重复 g*g → [k*g*g]
+
+        Args:
+            pose_embs:   [k, dim]            每个被检索帧的 pose_emb（K 源）
+            visual_embs: [k, dim] 或         旧路径帧级 visual_emb
+                         [k, g*g, dim]       新路径 patch 级 visual_emb
+            tier_ids:    [k] int64 或 None   每帧所属层 id（0/1/2）
+
+        Returns:
+            (memory_states, memory_value_states, tier_ids_out)：
+              memory_states       [1, K', dim]
+              memory_value_states [1, K', dim]
+              tier_ids_out        [K'] int64 或 None
+        """
+        if self.spatial_v_grid is None:
+            # 旧路径：帧级，直接加 batch 维（等价于现有 pipeline 的 unsqueeze(0)）
+            memory_states = pose_embs.unsqueeze(0)             # [1, k, dim]
+            memory_value_states = visual_embs.unsqueeze(0)     # [1, k, dim]
+            return memory_states, memory_value_states, tier_ids
+
+        g = self.spatial_v_grid
+        gg = g * g
+        k = pose_embs.shape[0]
+        assert visual_embs.dim() == 3 and visual_embs.shape[1] == gg, (
+            f"build_memory_kv: spatial_v_grid={g} expects visual_embs [k, {gg}, dim], "
+            f"got {tuple(visual_embs.shape)}"
+        )
+        dim = pose_embs.shape[-1]
+        dev = pose_embs.device
+
+        # V：[k, g*g, dim] → [k*g*g, dim] → [1, k*g*g, dim]
+        memory_value_states = visual_embs.reshape(k * gg, dim).unsqueeze(0)
+
+        # K：每帧 pose 重复 g*g 次 + patch_pos_emb（2D 位置编码）
+        pos = self.patch_pos_emb.to(device=dev, dtype=pose_embs.dtype)  # [g*g, dim]
+        # pose_embs[:, None, :] [k,1,dim] 广播 + pos[None] [1,g*g,dim] → [k, g*g, dim]
+        key_full = pose_embs.unsqueeze(1) + pos.unsqueeze(0)            # [k, g*g, dim]
+        memory_states = key_full.reshape(k * gg, dim).unsqueeze(0)      # [1, k*g*g, dim]
+
+        # tier_ids：每帧重复 g*g 次
+        tier_ids_out = None
+        if tier_ids is not None:
+            tier_ids_out = tier_ids.to(dev).repeat_interleave(gg)       # [k*g*g]
+
+        return memory_states, memory_value_states, tier_ids_out
 
     def get_semantic_key(
         self,
@@ -305,6 +396,10 @@ class WanModelWithMemory(WanModel):
         pose_key = torch.stack(keys).mean(dim=0)  # [dim=5120]
 
         if visual_emb is not None:
+            # Exp2 spatial-V：若传入 patch 级 visual_emb [g*g, dim]，先均值还原为帧级 [dim]，
+            # 保证 novelty / 检索特征与帧级行为完全一致（语义 key 不引入空间布局）
+            if visual_emb.dim() == 2:
+                visual_emb = visual_emb.mean(dim=0)  # [g*g, dim] → [dim]
             # Innovation 9: Visual Feature Fusion — 融合视觉特征
             vis_key = torch_F.normalize(self.visual_key_proj(visual_emb), dim=-1)
             key = alpha * torch_F.normalize(pose_key, dim=-1) + (1.0 - alpha) * vis_key
@@ -361,6 +456,7 @@ class WanModelWithMemory(WanModel):
         memory_layers: Optional[List[int]] = None,
         max_memory_size: int = 8,
         skip_to_device: bool = False,
+        spatial_v_grid: Optional[int] = None,
     ) -> "WanModelWithMemory":
         """从已加载的预训练 WanModel 转换为 WanModelWithMemory。
 
@@ -402,6 +498,7 @@ class WanModelWithMemory(WanModel):
             eps=cfg['eps'],
             memory_layers=memory_layers,
             max_memory_size=max_memory_size,
+            spatial_v_grid=spatial_v_grid,
         )
 
         # 将 base_model 的 state_dict key 重映射，使 memory_layers 中的

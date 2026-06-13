@@ -103,9 +103,11 @@ class MemoryCrossAttention(nn.Module):
         self.norm_q = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-        # 0.1-init gate：初始化为 0.1，使 memory 从训练开始就有微弱贡献，避免 W_q/W_k/W_v/W_o 梯度恒为 0
-        # 参考 WorldMem dit.py L304 gate 机制；gate=0.1 → memory 初始有 ~10% 贡献，梯度路径打通（F-08 fix）
-        self.gate = nn.Parameter(torch.ones(1) * 0.1)
+        # 1.0-init gate（Exp2 spatial-V）：初始化为 1.0，memory 起步即满贡献，
+        # 用于验证 patch 级 spatial V 的上限；保留为可学习参数，训练中可自调。
+        # （此前为 0.1-init，F-08 fix 仅为打通梯度路径；spatial-V 下提至 1.0 以充分利用空间信息）
+        # 参考 WorldMem dit.py L304 gate 机制。
+        self.gate = nn.Parameter(torch.ones(1) * 1.0)
 
         # Innovation 10：Tier Embedding — 告知模型检索帧来自 Short/Medium/Long 层
         # 0=Short（连续性锚点），1=Medium（动态事件），2=Long（稳定场景）

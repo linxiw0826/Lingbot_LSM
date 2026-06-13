@@ -57,8 +57,9 @@ class MemoryFrame:
                     用于 NFPHead 的预测目标。
         surprise_score: NFPHead 计算的 cosine distance（越大越"意外"）。
         timestep:   原始视频帧索引，用于 temporal ordering。
-        visual_emb: [dim=5120]，VAE latent 投影到模型空间的视觉嵌入；
-                    用作 MemoryCrossAttention 的 Value（视觉内容）。
+        visual_emb: VAE latent 投影到模型空间的视觉嵌入，用作 MemoryCrossAttention 的 Value。
+                    可为 [dim=5120]（帧级，旧行为）或 [g*g, dim]（patch 级，Exp2 spatial-V）。
+                    存储时原样保存，不在存储时池化。
                     若 None 则 retrieve() 退化为 pose_emb 做 V（向后兼容）。
                     # MODIFIED: F-03/F5 fix, authorized by Orchestrator 2026-04-02
     """
@@ -229,12 +230,14 @@ class MemoryBank:
         ).to(device)   # [k, dim]
 
         # 若任何帧有 visual_emb，则为每帧填充（None 退化为 pose_emb）
+        # Exp2 spatial-V：若 visual_emb 是 [g*g, dim]，stack 后为 [k, g*g, dim]（patch 级）；
+        #   帧级 [dim] 时为 [k, dim]（旧行为）。上层 build_memory_kv 据维度区分。
         if any(self.frames[i].visual_emb is not None for i in idx_list):
             visual_embs = torch.stack([
                 self.frames[i].visual_emb if self.frames[i].visual_emb is not None
                 else self.frames[i].pose_emb
                 for i in idx_list
-            ]).to(device)   # [k, dim]
+            ]).to(device)   # [k, dim] 或 [k, g*g, dim]
         else:
             visual_embs = pose_embs   # 退化路径（向后兼容）
 
@@ -968,11 +971,13 @@ class ThreeTierMemoryBank:
             [f.pose_emb for f in selected_frames]
         ).to(device)  # [K, dim]
 
+        # Exp2 spatial-V：visual_emb 为 [g*g, dim] 时 stack 成 [K, g*g, dim]（patch 级）；
+        #   帧级 [dim] 时为 [K, dim]（旧行为）。上层 build_memory_kv 据维度区分。
         if any(f.visual_emb is not None for f in selected_frames):
             visual_embs = torch.stack([
                 f.visual_emb if f.visual_emb is not None else f.pose_emb
                 for f in selected_frames
-            ]).to(device)  # [K, dim]
+            ]).to(device)  # [K, dim] 或 [K, g*g, dim]
         else:
             visual_embs = pose_embs  # 退化路径
 
