@@ -726,42 +726,102 @@ def _build_anchor_inputs(
 # verdict
 # ---------------------------------------------------------------------------
 
+def _per_query_sign_stats(
+    per_point: List[Dict],
+    off_key: str,
+    oracle_key: str,
+    wrong_key: str,
+) -> Dict:
+    """per-query 符号口径（experiment_design「Exp 2 本轮执行口径」/ [[F-20]] 教训）。
+
+    不只看 episode/全局均值（单点卡阈值会被均值掩盖），而是逐重访查询点看符号：
+      - oracle−off 在各点**多数为正**（记忆被因果使用 → 提升一致性）
+      - wrong−off 在各点**多数为负**（注入错误锚反而拉低）
+    返回各点 gap 的符号统计（正占比 / 负占比 / 样本数），SSIM、DINO 各调用一次。
+    某点 off 或对照值缺失（None）→ 该点该 gap 跳过，不计入分母。
+    """
+    n_oracle_pos = n_oracle = 0
+    n_wrong_neg = n_wrong = 0
+    for r in per_point:
+        off = r.get(off_key)
+        ora = r.get(oracle_key)
+        wro = r.get(wrong_key)
+        if off is not None and ora is not None:
+            n_oracle += 1
+            if (ora - off) > 0:
+                n_oracle_pos += 1
+        if off is not None and wro is not None:
+            n_wrong += 1
+            if (wro - off) < 0:
+                n_wrong_neg += 1
+    return {
+        "n_oracle_points": n_oracle,
+        "oracle_minus_off_pos_count": n_oracle_pos,
+        "oracle_minus_off_pos_frac": (n_oracle_pos / n_oracle) if n_oracle else None,
+        "n_wrong_points": n_wrong,
+        "wrong_minus_off_neg_count": n_wrong_neg,
+        "wrong_minus_off_neg_frac": (n_wrong_neg / n_wrong) if n_wrong else None,
+    }
+
+
 def _compute_verdict(
     per_point: List[Dict],
     gap_threshold: float,
 ) -> Dict:
-    """聚合 off/oracle/wrong 的 rc_max，给自动 verdict。
+    """聚合 off/oracle/wrong 的 rc_max，给自动 verdict（SSIM 与 DINO 两套并列）。
 
-    判定（用各重访点的均值）：
-      (oracle-off) >= +gap_threshold 且 oracle > wrong → 上界成立
-      否则 → 上界不成立
+    **DINO 为主判据**（experiment_design「Exp2 评测指标补强」/ [[F-21]]），SSIM 为辅、
+    向后兼容（N=2 旧结果仍可比）。两套各算：
+      (1) episode 均值口径：(oracle−off) >= +gap_threshold 且 oracle > wrong → 上界成立。
+      (2) per-query 符号口径（[[F-20]] 教训，主看）：各重访点 oracle−off 多数为正
+          + wrong−off 多数为负 → 方向性接口裁决（结果 A）。
+    DINO 全缺失（加载失败）时 DINO 均值/符号统计为 None，自动回退 SSIM 主判。
     """
-    offs = [r["off"] for r in per_point if r.get("off") is not None]
-    oracles = [r["oracle"] for r in per_point if r.get("oracle") is not None]
-    wrongs = [r["wrong"] for r in per_point if r.get("wrong") is not None]
 
-    def _mean(xs):
-        return float(np.mean(xs)) if xs else None
+    def _mean_gap_holds(off_key, oracle_key, wrong_key):
+        offs = [r[off_key] for r in per_point if r.get(off_key) is not None]
+        oracles = [r[oracle_key] for r in per_point if r.get(oracle_key) is not None]
+        wrongs = [r[wrong_key] for r in per_point if r.get(wrong_key) is not None]
 
-    off_m, oracle_m, wrong_m = _mean(offs), _mean(oracles), _mean(wrongs)
-    gap_oracle = (oracle_m - off_m) if (oracle_m is not None and off_m is not None) else None
-    gap_wrong = (wrong_m - off_m) if (wrong_m is not None and off_m is not None) else None
+        def _mean(xs):
+            return float(np.mean(xs)) if xs else None
 
-    holds = False
-    if (gap_oracle is not None and oracle_m is not None and wrong_m is not None):
-        holds = (gap_oracle >= gap_threshold) and (oracle_m > wrong_m)
+        off_m, oracle_m, wrong_m = _mean(offs), _mean(oracles), _mean(wrongs)
+        gap_oracle = (oracle_m - off_m) if (oracle_m is not None and off_m is not None) else None
+        gap_wrong = (wrong_m - off_m) if (wrong_m is not None and off_m is not None) else None
+        holds = False
+        if (gap_oracle is not None and oracle_m is not None and wrong_m is not None):
+            holds = (gap_oracle >= gap_threshold) and (oracle_m > wrong_m)
+        return off_m, oracle_m, wrong_m, gap_oracle, gap_wrong, holds
 
-    if holds:
+    # ---- SSIM（向后兼容字段名）----
+    (off_m, oracle_m, wrong_m,
+     gap_oracle, gap_wrong, holds) = _mean_gap_holds("off", "oracle", "wrong")
+    ssim_sign = _per_query_sign_stats(per_point, "off", "oracle", "wrong")
+
+    # ---- DINO（主判据；rc_dino_max 字段 off_dino/oracle_dino/wrong_dino）----
+    (off_dm, oracle_dm, wrong_dm,
+     gap_oracle_d, gap_wrong_d, holds_d) = _mean_gap_holds(
+        "off_dino", "oracle_dino", "wrong_dino")
+    dino_sign = _per_query_sign_stats(per_point, "off_dino", "oracle_dino", "wrong_dino")
+    dino_available = (off_dm is not None and oracle_dm is not None)
+
+    # 主判据：DINO 优先（可用时），否则回退 SSIM
+    primary = "dino" if dino_available else "ssim"
+    holds_primary = holds_d if dino_available else holds
+
+    if holds_primary:
         verdict = (
-            "idea 上界成立：冻结骨干能利用记忆帧，病在我们模块实现 → "
-            "进 Stage 2 改 V 表征+修 Key+放带宽"
+            f"idea 上界成立（主判据={primary.upper()}）：冻结骨干能利用记忆帧，"
+            "病在我们模块实现 → 进 Stage 2 改 V 表征+修 Key+放带宽"
         )
     else:
         verdict = (
-            "idea 上界不成立：冻结骨干用不了外部记忆帧 → "
+            f"idea 上界不成立（主判据={primary.upper()}）：冻结骨干用不了外部记忆帧 → "
             "需换干预（解冻部分 block）"
         )
     return {
+        # ---- SSIM（向后兼容，旧字段名不变）----
         "off_mean": off_m,
         "oracle_mean": oracle_m,
         "wrong_mean": wrong_m,
@@ -769,6 +829,19 @@ def _compute_verdict(
         "gap_wrong_minus_off": gap_wrong,
         "gap_threshold": gap_threshold,
         "upper_bound_holds": holds,
+        "ssim_per_query_sign": ssim_sign,
+        # ---- DINO（主判据，新增）----
+        "off_mean_dino": off_dm,
+        "oracle_mean_dino": oracle_dm,
+        "wrong_mean_dino": wrong_dm,
+        "gap_oracle_minus_off_dino": gap_oracle_d,
+        "gap_wrong_minus_off_dino": gap_wrong_d,
+        "upper_bound_holds_dino": holds_d,
+        "dino_per_query_sign": dino_sign,
+        "dino_available": dino_available,
+        # ---- 主判据标注 ----
+        "primary_metric": primary,
+        "upper_bound_holds_primary": holds_primary,
         "verdict": verdict,
     }
 
@@ -815,31 +888,66 @@ def _write_summary(args, per_point: List[Dict], verdict: Dict) -> None:
               "**memory cross-attn 全程关闭**（memory_states=None）。\n")
     md.append("> 指标 revisit_consistency = max_t SSIM(gen_query[:,t], 首访 GT 帧)。\n\n")
 
-    md.append("## 每个重访点 × 三 arm\n\n")
+    def _f(x):
+        return f"{x:.4f}" if isinstance(x, (int, float)) else "—"
+
+    md.append("## 每个重访点 × 三 arm（SSIM rc_max + DINO rc_dino_max 并列）\n\n")
     md.append("| episode | query_frame | first_visit | off | oracle | wrong | "
-              "oracle−off | wrong−off |\n")
-    md.append("|---|---|---|---|---|---|---|---|\n")
+              "oracle−off | wrong−off | "
+              "off_dino | oracle_dino | wrong_dino | "
+              "oracle−off (dino) | wrong−off (dino) |\n")
+    md.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|\n")
     for r in per_point:
-        def _f(x):
-            return f"{x:.4f}" if isinstance(x, (int, float)) else "—"
         g_o = (r["oracle"] - r["off"]) if (r.get("oracle") is not None and r.get("off") is not None) else None
         g_w = (r["wrong"] - r["off"]) if (r.get("wrong") is not None and r.get("off") is not None) else None
+        g_od = (r["oracle_dino"] - r["off_dino"]) if (r.get("oracle_dino") is not None and r.get("off_dino") is not None) else None
+        g_wd = (r["wrong_dino"] - r["off_dino"]) if (r.get("wrong_dino") is not None and r.get("off_dino") is not None) else None
         md.append(
             f"| {r['episode_id']} | {r['query_frame']} | {r['first_visit_frame']} | "
             f"{_f(r.get('off'))} | {_f(r.get('oracle'))} | {_f(r.get('wrong'))} | "
-            f"{_f(g_o)} | {_f(g_w)} |\n"
+            f"{_f(g_o)} | {_f(g_w)} | "
+            f"{_f(r.get('off_dino'))} | {_f(r.get('oracle_dino'))} | {_f(r.get('wrong_dino'))} | "
+            f"{_f(g_od)} | {_f(g_wd)} |\n"
         )
 
-    md.append("\n## 自动 Verdict\n\n")
+    md.append("\n## 自动 Verdict（**DINO 为主判据**，SSIM 为辅 / 向后兼容）\n\n")
+    md.append(f"- **主判据：{verdict['primary_metric'].upper()}**"
+              f"（dino_available={verdict['dino_available']}；"
+              f"DINO 全缺失时自动回退 SSIM）\n\n")
+
+    md.append("### DINO（主判据）\n\n")
+    md.append(f"- off_mean_dino   = {verdict['off_mean_dino']}\n")
+    md.append(f"- oracle_mean_dino= {verdict['oracle_mean_dino']}\n")
+    md.append(f"- wrong_mean_dino = {verdict['wrong_mean_dino']}\n")
+    md.append(f"- gap (oracle−off, dino) = {verdict['gap_oracle_minus_off_dino']} "
+              f"(阈值 ≥ {verdict['gap_threshold']})\n")
+    md.append(f"- gap (wrong−off, dino)  = {verdict['gap_wrong_minus_off_dino']}\n")
+    _ds = verdict["dino_per_query_sign"]
+    md.append(f"- per-query 符号（[[F-20]] 教训，主看）："
+              f"oracle−off 正占比 = {_f(_ds['oracle_minus_off_pos_frac'])} "
+              f"({_ds['oracle_minus_off_pos_count']}/{_ds['n_oracle_points']})；"
+              f"wrong−off 负占比 = {_f(_ds['wrong_minus_off_neg_frac'])} "
+              f"({_ds['wrong_minus_off_neg_count']}/{_ds['n_wrong_points']})\n")
+    md.append(f"- DINO 均值口径上界成立 = {verdict['upper_bound_holds_dino']}\n\n")
+
+    md.append("### SSIM（辅助 / 向后兼容）\n\n")
     md.append(f"- off_mean   = {verdict['off_mean']}\n")
     md.append(f"- oracle_mean= {verdict['oracle_mean']}\n")
     md.append(f"- wrong_mean = {verdict['wrong_mean']}\n")
     md.append(f"- gap (oracle−off) = {verdict['gap_oracle_minus_off']} "
               f"(阈值 ≥ {verdict['gap_threshold']})\n")
-    md.append(f"- gap (wrong−off)  = {verdict['gap_wrong_minus_off']}\n\n")
+    md.append(f"- gap (wrong−off)  = {verdict['gap_wrong_minus_off']}\n")
+    _ss = verdict["ssim_per_query_sign"]
+    md.append(f"- per-query 符号：oracle−off 正占比 = {_f(_ss['oracle_minus_off_pos_frac'])} "
+              f"({_ss['oracle_minus_off_pos_count']}/{_ss['n_oracle_points']})；"
+              f"wrong−off 负占比 = {_f(_ss['wrong_minus_off_neg_frac'])} "
+              f"({_ss['wrong_minus_off_neg_count']}/{_ss['n_wrong_points']})\n")
+    md.append(f"- SSIM 均值口径上界成立 = {verdict['upper_bound_holds']}\n\n")
+
     md.append(f"**结论：{verdict['verdict']}**\n\n")
-    md.append("判读规则：(oracle−off) ≥ +{:.2f} 且 oracle > wrong → 上界成立；"
-              "否则上界不成立。\n".format(verdict["gap_threshold"]))
+    md.append("判读规则（主判据 DINO）：(oracle−off) ≥ +{:.2f} 且 oracle > wrong → 上界成立；"
+              "且 per-query 符号（oracle−off 多数为正 + wrong−off 多数为负）做方向性裁决；"
+              "否则上界不成立。SSIM 同口径并列、向后兼容。\n".format(verdict["gap_threshold"]))
 
     md.append("\n## 人工定性对比\n\n")
     md.append("每个重访点已保存：\n")
@@ -984,7 +1092,10 @@ def main():
                     "episode_id": ep_id,
                     "query_frame": pt.query_frame,
                     "first_visit_frame": pt.first_visit_frame,
+                    # SSIM rc_max（向后兼容，N=2 旧结果仍可比）
                     "off": None, "oracle": None, "wrong": None,
+                    # DINO rc_dino_max（主判据；与 SSIM 字段并列，DINO 失败时占位 None）
+                    "off_dino": None, "oracle_dino": None, "wrong_dino": None,
                 }
 
                 # ---- 三 arm ----
@@ -1002,9 +1113,14 @@ def main():
                         if video is not None:
                             metrics = _revisit_consistency(video, gt_first)
                             point_record[arm_name] = metrics["revisit_consistency_max"]
-                            logger.info("ep=%s q=%d [%s] (读回) rc_max=%.4f",
+                            # DINO 主判据：_revisit_consistency 内部已算（DINO 加载失败时
+                            # 返回 dict 无 dino_* key → .get() 得 None，占位稳定）
+                            point_record[f"{arm_name}_dino"] = metrics.get(
+                                "revisit_consistency_dino_max")
+                            logger.info("ep=%s q=%d [%s] (读回) rc_max=%.4f rc_dino_max=%s",
                                         ep_id, pt.query_frame, arm_name,
-                                        metrics["revisit_consistency_max"])
+                                        metrics["revisit_consistency_max"],
+                                        metrics.get("revisit_consistency_dino_max"))
                             continue
 
                     anchor_latent = anchor_in[0] if anchor_in is not None else None
@@ -1024,10 +1140,14 @@ def main():
                     _save_video(video, mp4_path, fps=args.fps)
                     metrics = _revisit_consistency(video, gt_first)
                     point_record[arm_name] = metrics["revisit_consistency_max"]
-                    logger.info("ep=%s q=%d [%s] rc_max=%.4f rc_mean=%.4f",
+                    # DINO 主判据：与 SSIM 字段并列记录（DINO 加载失败 → None 占位）
+                    point_record[f"{arm_name}_dino"] = metrics.get(
+                        "revisit_consistency_dino_max")
+                    logger.info("ep=%s q=%d [%s] rc_max=%.4f rc_mean=%.4f rc_dino_max=%s",
                                 ep_id, pt.query_frame, arm_name,
                                 metrics["revisit_consistency_max"],
-                                metrics["revisit_consistency_mean"])
+                                metrics["revisit_consistency_mean"],
+                                metrics.get("revisit_consistency_dino_max"))
                     torch.cuda.empty_cache()
 
                 all_per_point.append(point_record)
