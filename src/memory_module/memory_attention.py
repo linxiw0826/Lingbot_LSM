@@ -86,6 +86,7 @@ class MemoryCrossAttention(nn.Module):
         num_heads: int,
         qk_norm: bool = True,
         eps: float = 1e-6,
+        out_rms_cap: float = 1.0,
     ):
         super().__init__()
         assert dim % num_heads == 0, f"dim {dim} must be divisible by num_heads {num_heads}"
@@ -93,6 +94,10 @@ class MemoryCrossAttention(nn.Module):
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
+        self.eps = eps
+        # 注入幅度硬上界常数（非参数，不可训练）：forward 里把分支输出 per-token RMS
+        # 截断到 <= out_rms_cap。见 forward 中 clip-by-RMS 说明。
+        self.out_rms_cap = float(out_rms_cap)
 
         self.q = nn.Linear(dim, dim, bias=False)
         self.k = nn.Linear(dim, dim, bias=False)
@@ -102,12 +107,32 @@ class MemoryCrossAttention(nn.Module):
         # Q/K 归一化（与 WanSelfAttention 保持一致）
         self.norm_q = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        # NOTE: 不对 V 做 norm —— 之前加的 norm_v 会把 value 钉成单位 RMS，抹掉「强/弱
+        #   记忆」的幅度信息，可能伤注入有效性。把 V 拉进分布内的事改由后续单独工作用
+        #   保幅度的方式做，这里不误伤目标③（注入有效性）。
+        # NOTE: 注入幅度的硬上界不再用可训练 RMSNorm（其 weight 可被训练推大 → 假上界，
+        #   且训练脚本对整个 memory 模块 requires_grad_(True) 会解冻它），改为 forward 里
+        #   无参数的 clip-by-RMS 硬截断（见 forward）。
 
-        # 1.0-init gate（Exp2 spatial-V）：初始化为 1.0，memory 起步即满贡献，
-        # 用于验证 patch 级 spatial V 的上限；保留为可学习参数，训练中可自调。
-        # （此前为 0.1-init，F-08 fix 仅为打通梯度路径；spatial-V 下提至 1.0 以充分利用空间信息）
-        # 参考 WorldMem dit.py L304 gate 机制。
-        self.gate = nn.Parameter(torch.ones(1) * 1.0)
+        # Flamingo 式 tanh(α) gate，α（=self.gate）为 pre-tanh logit，init=0
+        # → 有效 gate = tanh(0) = 0 = 恒等（注入分支起步对冻结骨干零贡献），
+        #   再由训练把 α 慢慢推大，有效 gate 在 [-1, 1] 内有界增长。
+        # 动机（回链 F-25）：裸标量 init=1.0 + 无 squash 会让冻结骨干从第 1 步就被满
+        #   强度注入；配合扩散 exposure bias（单步训练 loss 看不见 70 步采样里的误差
+        #   累积），gate 卡在 ~1.0、推理塌成噪点。WorldMem / Flamingo / ControlNet /
+        #   IP-Adapter 等能 work 的注入都让分支从恒等(≈0)起步再慢慢长大
+        #   （zero-init gate / tanh(α=0) / zero-conv）。
+        #
+        # ⚠️ checkpoint 格式变更：本参数语义由「裸标量 = raw 乘子」改为「pre-tanh
+        #   logit」。旧 checkpoint（epoch_1/2/3）的 gate 值与新模块语义不兼容（旧
+        #   gate=0.99 ≠ 新 tanh(0.99)=0.76），须重训 fresh；评测旧 checkpoint 必须
+        #   用对应旧 git 版本代码。
+        #
+        # NOTE: 参数属性名保留为 self.gate（不改名），使所有读 .gate / _last_gate_value
+        #   的诊断/日志代码（wandb_utils.py / memory_injection_diag.py /
+        #   train_v4_stage1_dual.py / eval_ablation.py）无需连带改动；但语义已变为
+        #   logit（见上）。
+        self.gate = nn.Parameter(torch.zeros(1))
 
         # Innovation 10：Tier Embedding — 告知模型检索帧来自 Short/Medium/Long 层
         # 0=Short（连续性锚点），1=Medium（动态事件），2=Long（稳定场景）
@@ -173,6 +198,7 @@ class MemoryCrossAttention(nn.Module):
         # MODIFIED: F-03/F5 fix, authorized by Orchestrator 2026-04-02
         q = self.norm_q(self.q(x)).view(B, L, self.num_heads, self.head_dim)
         k = self.norm_k(self.k(memory_key_states)).view(B, K, self.num_heads, self.head_dim)
+        # V 不做 norm（保留「强/弱记忆」幅度信息，避免误伤注入有效性 = 目标③）。
         v = self.v(memory_value_states).view(B, K, self.num_heads, self.head_dim)
 
         # Innovation 10：Tier Embedding — 在 K 上叠加 tier 嵌入，告知模型帧来自哪一层
@@ -188,10 +214,20 @@ class MemoryCrossAttention(nn.Module):
         # Merge heads: [B, L, dim]
         out = self.o(out.flatten(2))
 
-        # 记录诊断指标（detach 避免影响计算图）
-        # NOTE: 不做 .float() 转换，避免 gradient checkpointing 重计算时产生额外 640MB 显存峰值
+        # 注入幅度硬上界（无可训练参数 → 训练对 memory 模块 requires_grad_(True) 解冻后依然生效，
+        # 区别于可训练 weight 的 RMSNorm「软上界」）。把分支输出 per-token RMS 截断到 <= out_rms_cap：
+        # 超过上限才按比例缩小，低于上限原样保留 —— 保留 attention 对「该注入多少」的调幅能力，
+        # 不像 RMSNorm 把注入幅度钉成常数。动机回链 F-25（注入幅度/分布外是采样塌噪主因）。
+        # NOTE: 不做 .float() 转换，避免 gradient checkpointing 重计算时产生额外 640MB 显存峰值。
         with torch.no_grad():
+            # 诊断记录 clip 前的真实 attention 信号范数（会随训练/输入变化，
+            # 用于判断注入分支是否真在学到内容；clip 后近常数，无诊断价值）。
             self._last_attn_out_norm = out.detach().norm().item()
-            self._last_gate_value = self.gate.item()
-        # Gate 缩放：初始化为 0.1，训练过程中逐渐调整（F-08 fix）
-        return self.gate * out
+            self._last_gate_value = torch.tanh(self.gate).item()
+        _rms = out.pow(2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()   # [B, L, 1]
+        out = out * (self.out_rms_cap / _rms).clamp(max=1.0)
+        # Gate 缩放：有效 gate = tanh(self.gate)，self.gate 为 pre-tanh logit，
+        # init=0 → 有效 gate=0（恒等起步，Flamingo α=0 原理，回链 F-25），训练中长大。
+        # 真·硬上界：tanh(gate)∈[-1,1] 乘以 per-token RMS ≤ out_rms_cap 的 out，
+        #   无可训练参数可把上界推大 → 注入吹不爆冻结骨干残差流。
+        return torch.tanh(self.gate) * out
