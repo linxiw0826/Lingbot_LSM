@@ -56,9 +56,11 @@ Stage 2 训练日志 Long tier 全程 0l/32 从未填过 → tier_emb 的 tier_i
 首帧弱化（--weaken_first_frame，D-06）
 -------------------------------------
 砍掉首帧 image condition 这条强信号通道，制造"模型不靠记忆就答不出"的清洁实验条件。
-- noise : 随机噪声替代首帧（默认，相对温和）
-- zero  : 首帧置零（中性灰）
+- zero  : 首帧置零（中性灰，**默认**）——温和锚点，给记忆留贡献空间又不毁场景
 - none  : 不弱化（首帧条件保留）
+- noise : 随机 RGB 替代首帧（仅消融）——F-18：随机 RGB 会摧毁 i2v 场景锚点，
+          三臂（off/oracle/wrong）都生成噪点/无关视频、revisit 指标全部地板化、
+          oracle-vs-wrong 无法对比，故不再作默认。
 首帧弱化在 WanI2V.generate() 的 `img` 入口处替换 PIL 图像实现——不修改 image2video.py。
 
 依赖与约束
@@ -175,9 +177,11 @@ def _parse_args():
                         "等于在 K 上叠未训练的随机 tier 向量给注入掺噪、压低 oracle 效果、污染判读。"
                         "保留 long 选项做敏感性对照。")
     # ---- 首帧弱化（D-06）----
-    p.add_argument("--weaken_first_frame", type=str, default="noise",
+    p.add_argument("--weaken_first_frame", type=str, default="zero",
                    choices=["noise", "zero", "none"],
-                   help="noise=随机噪声替首帧（默认）/ zero=置零 / none=不弱化")
+                   help="zero=置零中性灰（默认，温和锚点）/ none=不弱化 / "
+                        "noise=随机 RGB 替首帧——已知会摧毁 i2v 场景锚点、使 revisit "
+                        "指标全部地板化（F-18），仅作消融用。")
 
     # ---- 重访点判定（复用 retrieval_probe 口径）----
     p.add_argument("--hit_dist", type=float, default=40.0,
@@ -1031,6 +1035,11 @@ def _generate_for_point(
 
 def main():
     args = _parse_args()
+    if args.weaken_first_frame == "noise":
+        logger.warning(
+            "⚠️ F-18: --weaken_first_frame=noise 会用随机 RGB 替换首帧、摧毁 i2v "
+            "场景锚点 → 三臂都生成噪点、revisit 指标全部地板化、oracle/wrong 无法对比。"
+            "revisit 一致性评测请用 zero(中性灰温和锚点);noise 仅作消融。")
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     rng = np.random.default_rng(args.seed)
