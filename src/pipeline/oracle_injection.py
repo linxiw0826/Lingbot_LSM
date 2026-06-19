@@ -166,6 +166,16 @@ def _parse_args():
                    help="oracle=注入 GT 历史帧 / off=不注入 / wrong=注入错误场景帧 / "
                         "random=从同 episode 历史帧随机抽一帧注入（confound 对照：判据 "
                         "oracle ≫ {random ≈ off}，排除'任何注入都涨'）")
+    # ---- gate 强制覆写（诊断用：解耦"接口有效性"与"训练是否开门"）----
+    p.add_argument("--gate_override", type=float, default=None,
+                   help="诊断用——强制把所有 block 的 memory cross-attn 有效 gate"
+                        "（post-tanh 乘子）设为该值（建议 0.1/0.3/1.0），用于解耦"
+                        "\"接口有效性\"与\"训练是否开门\"：fresh 重训中 gate 卡在 ~1e-3"
+                        "（exposure bias + gate 同时门控前/反向自饿），训出来的 gate ≈ 0"
+                        "→ 注入≈恒等 → oracle/off/wrong/random 四臂塌成几乎一样、无法判别"
+                        "\"接口是否有用\"。强制开门后：oracle ≫ {random≈off} → 接口有用、"
+                        "问题在训练；oracle≈off 或出噪点 → 接口真有问题（触发 #3）。"
+                        "默认 None=用 checkpoint 训出来的 gate（零改动路径，行为不变）。")
     # ---- 注入帧 tier label（D-06 配套：修 tier embedding 未训练坑）----
     p.add_argument("--inject_tier", type=str, default="medium",
                    choices=["short", "medium", "long"],
@@ -229,6 +239,67 @@ def _parse_args():
 # tier 名称 → MemoryCrossAttention.tier_emb 索引（Short=0/Medium=1/Long=2，
 # 与 memory_attention.py:116 nn.Embedding(3, dim) 的行序一致）
 _TIER_NAME_TO_ID = {"short": 0, "medium": 1, "long": 2}
+
+
+def _apply_gate_override(model, gate_override: float) -> None:
+    """诊断用——强制覆写所有 memory cross-attn 的有效 gate（与训练真实行为解耦）。
+
+    背景：fresh 重训中 memory cross-attn 的 gate 卡在 ~1e-3 且往 0 缩（exposure bias：
+    单步 diffusion loss 不奖励开门；gate 同时门控前/反向 → gate≈0 时 q/k/v/o 几乎拿不到
+    梯度、模块自饿）。用这种 checkpoint 跑 4 臂 eval，注入 ≈ 恒等 → oracle/off/wrong/
+    random 四臂塌成几乎一样，无法判别"接口是否有用"。本旋钮把"接口有效性"与"训练是否
+    开门"解耦：强制开门后若 oracle ≫ {random≈off} → 接口有用、问题在训练；若 oracle≈off
+    或出噪点 → 接口真有问题。
+
+    实现：MemoryCrossAttention.forward 末尾是 `torch.tanh(self.gate) * out`，要让 post-tanh
+    有效乘子 = g，需把 self.gate.data 设为 atanh(g)。对 g 做 [-0.9999,0.9999] clamp 防 atanh→inf。
+    **不动 out_rms_cap 的 clip-by-RMS 硬上界**（#2 幅度上界始终生效，强制开门也不会炸成噪点
+    —— 这正是 #2 的价值）。
+
+    ⚠️ 此结果不能等同于"训练后真实行为"，仅用于接口判别。
+
+    Args:
+        model:         WanModelWithMemory（pipeline.low_noise_model）
+        gate_override: 目标 post-tanh 有效 gate 值（如 0.1/0.3/1.0）
+    """
+    from memory_module.memory_attention import MemoryCrossAttention
+
+    # 命中模块：优先按类名 isinstance；退而求其次按 (gate, out_rms_cap) 双属性匹配，
+    # 避免误伤其它带 gate 的模块（如 WanAttentionBlock）。
+    def _is_mem_attn(m) -> bool:
+        return isinstance(m, MemoryCrossAttention) or (
+            hasattr(m, "gate") and hasattr(m, "out_rms_cap")
+        )
+
+    modules = [m for m in model.modules() if _is_mem_attn(m)]
+
+    # 覆写前先采集 trained tanh(gate) 的跨 block 均值（用于对照）
+    trained_vals: List[float] = []
+    for m in modules:
+        try:
+            trained_vals.append(float(torch.tanh(m.gate.detach()).mean().item()))
+        except Exception:  # noqa: BLE001
+            continue
+    mean_trained = (sum(trained_vals) / len(trained_vals)) if trained_vals else float("nan")
+
+    # g clamp 防 atanh→inf；atanh 的 dtype/device 与原 param 一致
+    g_clamped = min(max(float(gate_override), -0.9999), 0.9999)
+    n_overridden = 0
+    with torch.no_grad():
+        for m in modules:
+            target = torch.atanh(
+                torch.tensor(g_clamped, dtype=m.gate.dtype, device=m.gate.device)
+            )
+            m.gate.data.fill_(target.item())
+            n_overridden += 1
+
+    logger.warning(
+        "⚠️ [诊断模式] gate 强制覆写：所有 memory cross-attn 有效 gate（post-tanh）"
+        "被强制设为 %.4f（覆写前 mean trained tanh(gate)=%.6f）；命中并覆写 %d 个 module。"
+        "out_rms_cap 幅度硬上界不动（强制开门也不会炸成噪点）。"
+        "⚠️ 此结果不等同于\"训练后真实行为\"，仅用于解耦\"接口有效性\"与\"训练是否开门\"。",
+        g_clamped, mean_trained, n_overridden,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -895,6 +966,12 @@ def _record_point(
         "revisit_consistency_dino_last": None,
         **metrics,
     }
+    # 结果可溯源：把本次 --gate_override 取值写进 record（→ per_window.csv 末列）。
+    # None（未覆写，用 checkpoint 训出来的 gate）写 "trained"，便于事后区分不同 run。
+    # 追加到 record 末尾，不破坏既有列顺序（**metrics 之后）。
+    record["gate_override"] = (
+        "trained" if args.gate_override is None else args.gate_override
+    )
     all_records.append(record)
     # P1：逐点增量落盘，中途崩溃已完成点不丢失
     _append_per_window_csv(args.output_dir, record)
@@ -1112,6 +1189,12 @@ def main():
         low_model_dir=args.ft_model_dir,
     )
     model = wan_i2v.low_noise_model
+
+    # ---- gate 强制覆写（诊断用，default=None 时零改动跳过）----
+    # 必须在进入推理循环之前做：覆写所有 memory cross-attn 的有效 gate（post-tanh 乘子）。
+    # 与训练真实行为解耦 —— 仅用于判别"接口是否有用"，不改 out_rms_cap 幅度硬上界。
+    if args.gate_override is not None:
+        _apply_gate_override(model, args.gate_override)
 
     # ---- 逐 episode → 找重访点 → 三注入对照生成 ----
     import tempfile
@@ -1508,6 +1591,10 @@ def _write_summary(args, records: List[Dict]) -> None:
               f"memory_mode: **{args.memory_mode}** | "
               f"inject_tier: **{args.inject_tier}** | "
               f"weaken_first_frame: **{args.weaken_first_frame}**\n")
+    # 结果可溯源：记录本次 gate_override 取值（None=用 checkpoint 训出来的 gate）。
+    _gate_ov = "trained (None, 用 checkpoint 训出来的 gate)" if args.gate_override is None \
+        else f"**{args.gate_override}** (诊断模式：强制覆写有效 gate，与训练真实行为解耦)"
+    md.append(f"- gate_override: {_gate_ov}\n")
     md.append(f"- ft_model_dir: {args.ft_model_dir}\n\n")
     md.append("> ⚠️ 有效性前提：memory_cross_attn 须已训练（OP-1 修复 + 重训）。"
               "epoch_4 随机 memory 上仅作负对照。\n\n")
