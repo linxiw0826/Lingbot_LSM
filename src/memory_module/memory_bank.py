@@ -900,8 +900,9 @@ class ThreeTierMemoryBank:
         long_k: int = 2,
         device: Optional[torch.device] = None,
         return_tier_ids: bool = False,
+        return_latents: bool = False,
     ) -> Optional[Tuple[Tensor, ...]]:
-        """混合检索，返回去重后的 (key_states, value_states)，可选返回 tier_ids。
+        """混合检索，返回去重后的 (key_states, value_states)，可选返回 tier_ids / latents。
 
         检索预算：Short short_n 帧 + Medium top-medium_k + Long top-long_k。
         Cross-tier Dedup：移除 pose_emb cosine_sim > dup_threshold 的冗余帧。
@@ -922,13 +923,18 @@ class ThreeTierMemoryBank:
                                 tier="" 时映射到 0。
                                 若 False（默认），行为与修改前完全一致，返回 Tuple[Tensor, Tensor]
                                 （向后兼容约束：v3 的 key_states, value_states = bank.retrieve(...) 不 break）
+            return_latents:     若 True，**额外**在返回元组**末尾**追加 latents
+                                [K, z_dim, h, w]（所选帧 latent stack，供 v5 MemoryEncoder 用）。
+                                False（默认）时行为与修改前**逐字节一致**（v3/v4 既有调用零破坏）。
+                                可与 return_tier_ids 组合（latents 始终是最后一个元素）。
 
         Returns:
-            若 return_tier_ids=False（默认）:
-                (pose_embs, visual_embs)：各 [K, 5120]，K ≤ short_n+medium_k+long_k（去重后可能更少）
-            若 return_tier_ids=True:
-                (pose_embs, visual_embs, tier_ids)：前两项同上；
-                tier_ids: [K] int64，0=Short / 1=Medium / 2=Long
+            （以下按 (return_tier_ids, return_latents) 组合，latents 恒为末尾元素）
+            (False, False)（默认）: (pose_embs, visual_embs)，各 [K, 5120]
+            (True,  False):        (pose_embs, visual_embs, tier_ids)
+            (False, True):         (pose_embs, visual_embs, latents)
+            (True,  True):         (pose_embs, visual_embs, tier_ids, latents)
+            其中 latents: [K, z_dim, h, w]（所选帧 latent stack，各帧同分辨率可 stack）。
             若合并后为空（bank 全空）返回 None
         """
         # 1. 收集各层帧
@@ -986,8 +992,16 @@ class ThreeTierMemoryBank:
             len(short_frames), len(medium_frames), len(long_frames), len(selected_frames),
         )
 
+        # v5：可选 latents（恒为末尾元素，供 MemoryEncoder 用）。selected_frames 非空
+        # （前面已 return None 处理空情形），各帧 latent 同分辨率可 stack。
+        latents = None
+        if return_latents:
+            latents = torch.stack([f.latent for f in selected_frames]).to(device)  # [K, z_dim, h, w]
+
         if not return_tier_ids:
             # 向后兼容：v3 路径，不返回 tier_ids
+            if return_latents:
+                return pose_embs, visual_embs, latents
             return pose_embs, visual_embs
 
         # Innovation 10：构建 tier_ids 张量（int64），对应 selected_frames 顺序
@@ -995,6 +1009,8 @@ class ThreeTierMemoryBank:
         _TIER_MAP = {"short": 0, "medium": 1, "long": 2}
         tier_id_list = [_TIER_MAP.get(f.tier, 0) for f in selected_frames]
         tier_ids = torch.tensor(tier_id_list, dtype=torch.long, device=device)  # [K]
+        if return_latents:
+            return pose_embs, visual_embs, tier_ids, latents
         return pose_embs, visual_embs, tier_ids
 
     def retrieve_revisit(
@@ -1004,7 +1020,8 @@ class ThreeTierMemoryBank:
         top_k: int = 5,
         min_gap_frames: int = 0,
         device=None,
-    ) -> List[MemoryFrame]:
+        return_latents: bool = False,
+    ):
         """地点重访检索：只走 Long tier（Bug3：避开 short/medium 的近邻帧）+ 位置 L2（Bug2）。
 
         OP-2 重访检索路径（全部新增、与现有 retrieve 并存，不替换）。
@@ -1017,17 +1034,39 @@ class ThreeTierMemoryBank:
             top_k:           返回帧数上限
             min_gap_frames:  排除 timestep 距离 < 此值的近邻帧
             device:          保留参数
+            return_latents:  若 True，**额外**返回所选帧的 latent stack（供 v5 MemoryEncoder 用）。
+                             False（默认）时行为与修改前**逐字节一致**（只返回 List[MemoryFrame]，
+                             v4 既有调用零破坏）。
 
         Returns:
-            List[MemoryFrame]，按位置 L2 距离升序，长度 ≤ top_k。
+            return_latents=False（默认）:
+                List[MemoryFrame]，按位置 L2 距离升序，长度 ≤ top_k（与修改前完全一致）。
+            return_latents=True:
+                (frames, latents)：
+                  frames  = List[MemoryFrame]（同上）
+                  latents = [K, z_dim, h, w]（各帧 latent stack，K=len(frames)）；
+                            frames 为空时 latents 为 None。
+                            各帧 latent 同分辨率（同 episode 同 VAE），可直接 stack。
         """
-        return self.long.retrieve_by_location(
+        frames = self.long.retrieve_by_location(
             query_location=query_location,
             query_timestep=query_timestep,
             top_k=top_k,
             min_gap_frames=min_gap_frames,
             device=device,
         )
+        if not return_latents:
+            # 向后兼容：行为与修改前逐字节一致
+            return frames
+
+        # return_latents 路径：额外 stack 所选帧的 latent（MemoryFrame.latent: [z_dim, h, w]）
+        if not frames:
+            latents = None
+        else:
+            latents = torch.stack([f.latent for f in frames])  # [K, z_dim, h, w]
+            if device is not None:
+                latents = latents.to(device)
+        return frames, latents
 
     def increment_age(self) -> None:
         """只对 MediumTermBank 帧 +1（Long/Short 不依赖 age decay）。
