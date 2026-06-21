@@ -108,6 +108,17 @@ class MemorySelfAttention(WanSelfAttention):
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
+        # dtype 对齐（不依赖 autocast）：WanModel 的 modulation e/e0 故意走 float32
+        # （refs model.py:489 autocast(float32)+assert e.dtype==float32），故 block 算出的
+        # norm1(x)*(1+e)+e 会是 float32 传进本 self-attn。v4 靠外层 autocast 把 self.q 输入
+        # cast 回 bf16；但 v5 全冻骨干下本替换子模块疑似未吃到 autocast（ZeRO-3 对无可训练
+        # 参数的冻结子模块走不同路径），会崩在 self.q(float vs bf16)。这里显式对齐到权重
+        # dtype，保证 self.q/k/v 输入与权重同 dtype，不依赖 autocast（OFF + memory-ON 两条
+        # 路径都经 qkv_fn(x)，故覆盖二者）。
+        _w_dtype = self.q.weight.dtype
+        if x.dtype != _w_dtype:
+            x = x.to(_w_dtype)
+
         # query, key, value function（照搬父类 qkv_fn）
         def qkv_fn(x):
             q = self.norm_q(self.q(x)).view(b, s, n, d)
@@ -122,6 +133,10 @@ class MemorySelfAttention(WanSelfAttention):
         k_rope = rope_apply(k, grid_sizes, freqs)
 
         mem = self._mem_tokens
+        if mem is not None and mem.dtype != _w_dtype:
+            # memory token 来自 memory_encoder 应已是 bf16，但显式对齐更稳，
+            # 防 self.k(mem)/self.v(mem) 再撞 dtype（同 _w_dtype = self.q.weight.dtype）。
+            mem = mem.to(_w_dtype)
         if mem is None:
             # 无 memory：行为与父类 WanSelfAttention.forward 完全一致
             x = flash_attention(
