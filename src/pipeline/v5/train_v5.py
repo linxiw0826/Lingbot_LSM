@@ -1015,6 +1015,9 @@ def main():
     # 训练循环（脚手架照搬 v4：N-clip broadcast + OOM guard + accumulate）
     # ----------------------------------------------------------------
     global_step = start_global_step
+    # 全程可见的梯度范数（F-12 教训）；仅在 sync_gradients 分支更新，
+    # OOM/未 sync 的步保留上一次值，循环外初始化避免 NameError。
+    _last_grad_norm = 0.0
     try:
         for epoch in range(start_epoch, args.num_epochs):
             model.train()
@@ -1086,6 +1089,7 @@ def main():
                                     "loss/diffusion": _loss_components["diffusion"],
                                     "memory/bank_long": _loss_components["bank_long"],
                                     "memory/retrieved_k": _loss_components["bank_retrieved_k"],
+                                    "train/grad_norm": _last_grad_norm,
                                 }
                                 # model=None：v5 无 gate/memory_cross_attn，跳过相关诊断
                                 wb_logger.log_step(
@@ -1125,11 +1129,12 @@ def main():
                 if accelerator.is_main_process and global_step % args.log_every_steps == 0:
                     logger.info(
                         "step %d | n_ctx=%d | loss=%.4f (diff=%.4f) | "
-                        "bank_long=%d retr=%d",
+                        "bank_long=%d retr=%d | gnorm=%.3e",
                         global_step, _synced_n_ctx, loss.item(),
                         _loss_components["diffusion"],
                         int(_loss_components["bank_long"]),
                         int(_loss_components["bank_retrieved_k"]),
+                        _last_grad_norm,
                     )
 
                 if args.save_steps and global_step % args.save_steps == 0:
