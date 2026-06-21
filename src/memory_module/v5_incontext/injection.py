@@ -183,5 +183,9 @@ class MemorySelfAttention(WanSelfAttention):
 
         # output（照搬父类）
         x = x.flatten(2)
+        # dtype 对齐（不依赖 autocast）：flash_attention 输出 dtype 跟 q_rope
+        # （rope 内部 .float() → float32），撞 bf16 的 self.o。显式对齐到 o 权重 dtype。
+        # OFF 路径与 memory-ON 路径都汇到此处，故覆盖二者。
+        x = x.to(self.o.weight.dtype)
         x = self.o(x)
         return x
