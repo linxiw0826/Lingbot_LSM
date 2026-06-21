@@ -496,6 +496,16 @@ def multi_clip_training_step_v5(
     noisy_latent = (1.0 - sigma) * video_latent + sigma * noise
     target = noise - video_latent
 
+    # dtype 对齐：noised latent x 与条件 y 来自 VAE(float32)，但骨干为 bf16。
+    # autocast 在 CUDA 不可用/被禁用时是 no-op，patch_embedding(Conv3d) 会因
+    # "Input type (float) and bias type (BFloat16)" 崩溃 → forward 前显式对齐。
+    # 骨干 dtype 直接读骨干权重（ZeRO-3 下 next(parameters()) 不可靠，
+    # 与 memory_encoder 读 in_proj.weight.dtype、WanModel.forward 读
+    # patch_embedding.weight.device 同口径）。
+    _bb_dtype = model.patch_embedding.weight.dtype
+    noisy_latent = noisy_latent.to(dtype=_bb_dtype)
+    y = y.to(dtype=_bb_dtype)
+
     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
         pred = model(
             [noisy_latent],
@@ -704,6 +714,13 @@ def run_r6_probes(
     t_sched = t_sched.to(device).unsqueeze(0)
     noise = torch.randn_like(video_latent)
     noisy_latent = (1.0 - sigma) * video_latent + sigma * noise
+
+    # dtype 对齐：noised latent x 与条件 y(来自 VAE,float32) → 骨干 bf16。
+    # 与训练步同口径（读骨干 patch_embedding.weight.dtype）。一次对齐覆盖
+    # _fwd 的 ON / OFF / 梯度流三处 forward（闭包捕获 noisy_latent / y）。
+    _bb_dtype = unwrapped.patch_embedding.weight.dtype
+    noisy_latent = noisy_latent.to(dtype=_bb_dtype)
+    y = y.to(dtype=_bb_dtype)
 
     def _fwd(mem_arg):
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
