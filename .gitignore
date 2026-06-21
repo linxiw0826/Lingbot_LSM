@@ -9,8 +9,11 @@ __pycache__/
 .ipynb_checkpoints/
 .env
 
-# TMPDIR 孤儿(没设 TMPDIR=/tmp 留下的临时目录,污染仓库根)
+# TMPDIR / 分布式启动器 孤儿(没设 TMPDIR=/tmp 时留在仓库根的运行时临时目录)
 tmp*/
+torchelastic_*/
+pymp-*/
+.pymp-*/
 
 # 运行日志(数据,不入版本库;实际产物在 outputs/,已在仓库外)
 logs/
