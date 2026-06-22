@@ -864,6 +864,7 @@ def run_r6_probes(
     logging.info("R6 PROBE A 通过：注入对输出有影响。")
 
     # ---- 探针 B：梯度流（memory_encoder 非零梯度）----
+    # ⚠️ 本前向**不在** torch.no_grad 里（必须建图供 backward）；仅 PROBE A 的 ON/OFF 在 no_grad。
     for p in unwrapped.memory_encoder.parameters():
         if p.grad is not None:
             p.grad = None
@@ -871,18 +872,58 @@ def run_r6_probes(
     probe_loss = out_on_grad.float().pow(2).mean()
     accelerator.backward(probe_loss)
 
+    # DeepSpeed ZeRO-3 把梯度存在自己的分片 buffer，标准 `p.grad` 往往是 None/0（日志里
+    # `torch.autocast ... disabled within the DeepSpeed engine` 印证引擎接管）→ 用 p.grad
+    # 读会误判零梯度（false negative）。修法：优先用 deepspeed 的 safe_get_full_grad(p)
+    # 聚合 ZeRO-3 完整梯度，拿不到再依次回退 safe_get_local_grad → p.ds_tensor.grad → p.grad。
+    _get_grad = None
+    _grad_reader = "p.grad"
+    try:
+        from deepspeed.utils import safe_get_full_grad as _ds_full_grad
+        _get_grad = _ds_full_grad
+        _grad_reader = "deepspeed.safe_get_full_grad"
+    except Exception:
+        try:
+            from deepspeed.utils import safe_get_local_grad as _ds_local_grad
+            _get_grad = _ds_local_grad
+            _grad_reader = "deepspeed.safe_get_local_grad"
+        except Exception:
+            _get_grad = None
+            _grad_reader = "p.grad (deepspeed grad API 不可用)"
+
+    def _read_grad(p):
+        # 优先 deepspeed API；失败再试 ds_tensor.grad；最后回退 p.grad。
+        if _get_grad is not None:
+            try:
+                g = _get_grad(p)
+                if g is not None:
+                    return g
+            except Exception:
+                pass
+        ds_t = getattr(p, "ds_tensor", None)
+        if ds_t is not None and getattr(ds_t, "grad", None) is not None:
+            return ds_t.grad
+        return p.grad
+
     grad_total_sq = 0.0
     n_with_grad = 0
     for _, p in unwrapped.memory_encoder.named_parameters():
-        if p.grad is not None:
-            g = p.grad.float().norm().item()
-            grad_total_sq += g * g
-            if g > 0:
+        g = _read_grad(p)
+        if g is not None:
+            gn = float(g.detach().float().norm().item())
+            grad_total_sq += gn * gn
+            if gn > 0:
                 n_with_grad += 1
     grad_norm = grad_total_sq ** 0.5
+    if _get_grad is None:
+        logging.warning(
+            "R6 PROBE B: 无法经 deepspeed 读梯度（safe_get_full_grad/safe_get_local_grad "
+            "均不可用），回退 p.ds_tensor.grad/p.grad，ZeRO-3 下可能误判零梯度。"
+        )
     logging.info(
         "R6 PROBE B (grad flow): memory_encoder grad_norm=%.3e, "
-        "#params_with_nonzero_grad=%d", grad_norm, n_with_grad,
+        "#params_with_nonzero_grad=%d（grad_reader=%s）",
+        grad_norm, n_with_grad, _grad_reader,
     )
     # 清理本次探针产生的梯度，避免污染第一步训练
     for p in unwrapped.memory_encoder.parameters():
