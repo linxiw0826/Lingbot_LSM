@@ -130,7 +130,7 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# v5 专用梯度检查点（强制全 block，use_reentrant=False，OOM 修法）
+# v5 专用梯度检查点（强制全 block，use_reentrant=True + 输入 requires_grad_，OOM 修法）
 # ============================================================
 
 def enable_gradient_checkpointing_v5(model: nn.Module) -> int:
@@ -143,27 +143,29 @@ def enable_gradient_checkpointing_v5(model: nn.Module) -> int:
 
     与 v4 函数的关键区别：
       1. **去掉 requires_grad 跳过**：对每个 block 一律 patch。
-      2. **use_reentrant=False**：在「block 输入不 require grad（全冻骨干）」下仍能正确建反
-         传图到 memory_encoder；且与 ZeRO-3 in-place 参数释放、stash 副信道兼容更好
-         （reentrant=True 需输入 require grad 才建图，正是 v4 Exp0 要手动 x.requires_grad_
-         的原因；非 reentrant 用 saved-tensor-hook，无此约束）。
-      3. **显式把 mem 传入被 checkpoint 的函数**（最稳）：memory 本通过 self_attn 的 stash
+      2. **use_reentrant=True + 强制 block 输入 x.requires_grad_(True)**（照搬 v4 成功组合）：
+         use_reentrant=False 会触发 ZeRO-3 的 check_recomputed_tensors_match —— ZeRO-3 在
+         forward 后把参数重新分片成 shape [0]，backward 重算时 saved [5120] vs recomputed
+         [0] 对不上 → 崩（CheckpointError: Recomputed values ... different metadata）。
+         改用 reentrant=True 躲开该 check；但 reentrant 在「输入不 require grad」时不建反传图
+         （F-12/OP-1），故在调 checkpoint **之前**强制把传入的 x 设为 requires_grad_(True)
+         （v4/OP-1 写法）。ZeRO-3 在 reentrant 重算 forward 时会重新 gather 参数（v4 已验证可行）。
+      3. **显式把 mem 传入被 checkpoint 的函数**（保留）：memory 本通过 self_attn 的 stash
          副信道（block.self_attn._mem_tokens）进入 block，不是 block.forward 的显式参数。
          为确保 backward 重算时拿到的 mem 是「本步、且 require grad、且能连回 memory_encoder」
          的同一张量，这里在 wrap 内**先读出本步 stash 的 mem**，把它作为 checkpoint 的**显式
          入参**传进去；被 checkpoint 的内层函数在重算时用该 mem 重新 set_memory 再跑原 forward。
-         这样 mem 成为 checkpoint 的被追踪输入 → 非 reentrant 的 saved-tensor 机制会在重算时
-         喂回**完全相同**的 mem 张量，其上游（memory_encoder）的反传图不会断。
 
-    梯度为何能到 memory_encoder：
+    梯度为何能到 memory_encoder（use_reentrant=True 下）：
       - mem = memory_encoder(...) 在**checkpoint 区域之外**算好（在 model.forward 里，
         super().forward 之前），是一个 require-grad 的中间张量。
-      - 它作为 checkpoint(fn, x, ..., mem) 的显式输入；checkpoint 前向只存输入、丢中间激活。
-      - backward 时 checkpoint 用**保存的同一 mem 张量**重算 fn → 内层 set_memory(mem) →
-        block.self_attn 用 self.k(mem)/self.v(mem) 重建注意力 → 重算激活的反传图连到 mem →
-        mem 再连回 memory_encoder 的参数 → 梯度正确回流到唯一可训练件。
-      - block 的冻结参数无 grad（无所谓），但 x（block 输入）与 mem 的 grad 会沿链路传播；
-        非 reentrant checkpoint 不要求输入 require grad 即可正确建图。
+      - 它作为 checkpoint(fn, x, ..., mem) 的**显式输入**；reentrant 模式对**所有 require-grad
+        的输入张量**回传梯度（x 被手动设 require grad、mem 本就 require grad，二者都满足）。
+      - backward 时 reentrant 重算 fn → 内层 set_memory(mem) → block.self_attn 用
+        self.k(mem)/self.v(mem) 重建注意力 → 重算激活的反传图连到 mem → mem 再连回
+        memory_encoder 的参数 → 梯度正确回流到唯一可训练件。
+      - block 的冻结参数无 grad（无所谓）；reentrant 之所以需要 require-grad 输入，正是因为
+        它靠输入的 grad_fn 建反传图，故必须手动给 x（全冻骨干下输入无 grad）打 requires_grad_。
 
     返回 patch 的 block 数量。
     """
@@ -217,11 +219,19 @@ def enable_gradient_checkpointing_v5(model: nn.Module) -> int:
                     finally:
                         _in_ckpt[0] = False
 
-                # use_reentrant=False：冻结输入下仍正确建反传图；mem 作显式输入被追踪。
+                # OP-1 fix：reentrant checkpoint 靠输入的 grad_fn 建反传图，全冻骨干下 block
+                # 输入 x 无 requires_grad → reentrant 不建图 → memory_encoder 拿不到梯度
+                # （F-12）。故在调 checkpoint 前强制把传入的 x 设 requires_grad_(True)。
+                if torch.is_grad_enabled() and isinstance(x, torch.Tensor) and not x.requires_grad:
+                    x = x.requires_grad_(True)
+
+                # use_reentrant=True（照搬 v4）：躲开 ZeRO-3 的 check_recomputed_tensors_match
+                # （reentrant=False 在 ZeRO-3 重新分片参数到 shape [0] 时崩）。位置传参（含
+                # dit_cond_dict 非 tensor），与 v4 N-01 写法一致；mem 作显式 require-grad 入参。
                 return torch_checkpoint(
                     _run, x, e, seq_lens, grid_sizes, freqs,
                     context, context_lens, dit_cond_dict, mem,
-                    use_reentrant=False,
+                    use_reentrant=True,
                 )
             return _ckpt_forward
 
@@ -229,7 +239,8 @@ def enable_gradient_checkpointing_v5(model: nn.Module) -> int:
         patched += 1
 
     logging.info(
-        "v5 gradient checkpointing: 强制 patch %d 个 block（use_reentrant=False，mem 显式入参）。",
+        "v5 gradient checkpointing: 强制 patch %d 个 block（use_reentrant=True + 输入 "
+        "requires_grad_，mem 显式入参）。",
         patched,
     )
     return patched
@@ -1051,7 +1062,8 @@ def main():
     # ---- 梯度检查点（OOM 修法）：必须用 v5 专用 enable_gradient_checkpointing_v5。
     #      v4 的 enable_gradient_checkpointing 因 `if not any(p.requires_grad ...): continue`
     #      会对 v5 全冻骨干的所有 40 个 block 跳过 → no-op → 40 层 FFN 激活全驻留 → OOM。
-    #      v5 版强制对**每个** block 用 use_reentrant=False 检查点（重算激活、不驻留），
+    #      v5 版强制对**每个** block 用 use_reentrant=True（躲 ZeRO-3 check）+ 输入
+    #      x.requires_grad_(True)（reentrant 建图前提）检查点（重算激活、不驻留），
     #      并把 stash 的 mem 作显式入参传入 → backward 重算正确、梯度回流 memory_encoder。
     if args.gradient_checkpointing:
         enable_gradient_checkpointing_v5(model)
