@@ -41,13 +41,87 @@ _LINGBOT_WORLD = os.path.join(
 if _LINGBOT_WORLD not in sys.path:
     sys.path.insert(0, _LINGBOT_WORLD)
 
-from wan.modules.model import WanModel  # noqa: E402
+from wan.modules.model import WanModel, WanLayerNorm, WanRMSNorm  # noqa: E402
 
 # ---- v5_incontext 同级组件 ----
 from .injection import MemorySelfAttention  # noqa: E402
 from .memory_encoder import MemoryEncoder  # noqa: E402
 
 logger = logging.getLogger(__name__)
+
+
+# ----------------------------------------------------------------------
+# 全局 dtype-robust 修法（不依赖 autocast，让骨干 forward 类型自洽）
+# ----------------------------------------------------------------------
+#
+# 背景（v5 全冻骨干 + 探针 no_grad → autocast 整体失效）：
+#   - refs 的 WanLayerNorm/WanRMSNorm 设计在 float32 跑（`x.float()` + `type_as`），
+#     需要 float32 权重；blanket `.to(bf16)` 把它们压成 bf16 →
+#     `F.layer_norm(float32, bf16)` 崩。
+#   - 骨干 block 的 modulation e 故意是 float32（refs model.py:489/244 autocast(float32)
+#     + assert），故 block 算出的激活是 float32，流进 cross_attn/ffn 的 bf16 Linear → 崩。
+#   - time_embedding/time_projection 必须保持 float32 产出 e（探针已验证不崩）→ 不动它们。
+#
+# 本函数做两件事（详见 (A)/(B)）：
+#   (A) 所有 norm 模块权重 → float32（让 `x.float()` 路径成立）；
+#   (B) 给骨干「会吃 float32 激活的 bf16 矩阵 op」(Linear/Conv3d) 挂 forward_pre_hook，
+#       把输入 cast 到自己权重 dtype，从而不依赖 autocast。
+
+def _cast_pre_hook(module, args):
+    """forward_pre_hook：把 input[0] cast 到 module.weight.dtype（已同 dtype 则原样）。"""
+    if not args:
+        return args
+    x = args[0]
+    if isinstance(x, torch.Tensor) and x.dtype != module.weight.dtype:
+        x = x.to(module.weight.dtype)
+        return (x,) + args[1:]
+    return args
+
+
+def _make_dtype_robust(model: "WanModelWithMemoryV5"):
+    """让骨干 forward 不依赖 autocast 也类型自洽（在 model.to(dtype) 之后调用）。
+
+    (A) 所有 norm 模块（WanLayerNorm/WanRMSNorm/torch.nn.LayerNorm）权重 → float32。
+        memory_encoder 内部的 LayerNorm 也会被覆盖到——无害（float32 norm 更稳），
+        但只转 norm 类模块，memory_encoder 的非-norm 权重（Linear/in_proj）不被误转。
+    (B) 对骨干的 Linear/Conv3d（满足排除条件的）挂 forward_pre_hook，把输入 cast 到
+        自己权重 dtype。排除：time_embedding / time_projection（需保持 float32 产出 e，
+        挂了会把 e 变 bf16 触发 assert）、memory_encoder（自身 forward 已对齐 dtype）。
+        norm 类模块本就不是 Linear/Conv3d，不会被选中。
+
+    返回挂上的 hook 句柄列表（也存在 model._dtype_robust_hooks 上，确保不被 GC）。
+    """
+    # ---- (A) norm 权重 → float32 ----
+    n_norm = 0
+    for m in model.modules():
+        if isinstance(m, (WanRMSNorm, WanLayerNorm, torch.nn.LayerNorm)):
+            m.float()  # 只把 norm 类模块的 param/buffer cast 到 float32
+            n_norm += 1
+
+    # ---- (B) Linear/Conv3d 挂 forward_pre_hook（带排除）----
+    handles = []
+    n_hook = 0
+    for name, m in model.named_modules():
+        if not isinstance(m, (torch.nn.Linear, torch.nn.Conv3d)):
+            continue
+        # 排除：time_embedding/time_projection（保持 float32 产出 e）、memory_encoder（自洽）
+        if "time_embedding" in name or "time_projection" in name:
+            continue
+        if "memory_encoder" in name:
+            continue
+        handles.append(m.register_forward_pre_hook(_cast_pre_hook))
+        n_hook += 1
+
+    # 存住句柄，防 GC（模型生命周期内一直有效）
+    model._dtype_robust_hooks = handles
+
+    logger.info(
+        "_make_dtype_robust: norm→float32 %d 个（WanLayerNorm/WanRMSNorm/LayerNorm，"
+        "含 memory_encoder 内部 LayerNorm，无害）；挂 forward_pre_hook %d 个"
+        "（骨干 Linear/Conv3d；已排除 time_embedding/time_projection/memory_encoder）。",
+        n_norm, n_hook,
+    )
+    return handles
 
 
 class WanModelWithMemoryV5(WanModel):
@@ -257,5 +331,11 @@ class WanModelWithMemoryV5(WanModel):
         else:
             device = next(base_model.parameters()).device
             model = model.to(device=device, dtype=dtype)
+
+        # 全局 dtype-robust 修法：在 model.to(dtype) **之后** 调用——
+        #   (A) 把 norm 权重转回 float32（blanket .to(bf16) 已把它们压成 bf16），
+        #   (B) 给骨干 Linear/Conv3d 挂 forward_pre_hook 对齐输入 dtype。
+        # 让骨干 forward 不依赖 autocast 也类型自洽（终结 v5 dtype 连环崩）。
+        _make_dtype_robust(model)
 
         return model
