@@ -32,6 +32,7 @@ import sys
 from typing import List, Optional
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 # ---- 引入 lingbot-world 骨干（只继承/复用，不改 refs）----
@@ -41,7 +42,7 @@ _LINGBOT_WORLD = os.path.join(
 if _LINGBOT_WORLD not in sys.path:
     sys.path.insert(0, _LINGBOT_WORLD)
 
-from wan.modules.model import WanModel, WanLayerNorm, WanRMSNorm  # noqa: E402
+from wan.modules.model import WanModel, WanLayerNorm  # noqa: E402
 
 # ---- v5_incontext 同级组件 ----
 from .injection import MemorySelfAttention  # noqa: E402
@@ -57,15 +58,51 @@ logger = logging.getLogger(__name__)
 # 背景（v5 全冻骨干 + 探针 no_grad → autocast 整体失效）：
 #   - refs 的 WanLayerNorm/WanRMSNorm 设计在 float32 跑（`x.float()` + `type_as`），
 #     需要 float32 权重；blanket `.to(bf16)` 把它们压成 bf16 →
-#     `F.layer_norm(float32, bf16)` 崩。
+#     `F.layer_norm(float32, bf16 weight)` 崩。
 #   - 骨干 block 的 modulation e 故意是 float32（refs model.py:489/244 autocast(float32)
 #     + assert），故 block 算出的激活是 float32，流进 cross_attn/ffn 的 bf16 Linear → 崩。
 #   - time_embedding/time_projection 必须保持 float32 产出 e（探针已验证不崩）→ 不动它们。
 #
-# 本函数做两件事（详见 (A)/(B)）：
-#   (A) 所有 norm 模块权重 → float32（让 `x.float()` 路径成立）；
+# **关键教训**：静态把 norm 权重 cast 到 float32 救不了——`accelerator.prepare` 的
+#   deepspeed bf16 init 在 from_wan_model **之后** 把整个模型（含 norm 权重）重新压回
+#   bf16，撤销静态 param cast。但 **运行时 monkeypatch 的 forward 方法 / 注册在模块上的
+#   forward hook 能活过 deepspeed**（deepspeed 不动这些）。故本修法改用：
+#   (A) monkeypatch `WanLayerNorm.forward`：forward 内用 weight/bias 的 float32 **临时
+#       副本** 算 layer_norm（不改权重实际 dtype，deepspeed 友好），再 type_as(x) 转回；
 #   (B) 给骨干「会吃 float32 激活的 bf16 矩阵 op」(Linear/Conv3d) 挂 forward_pre_hook，
-#       把输入 cast 到自己权重 dtype，从而不依赖 autocast。
+#       把输入 cast 到自己权重 dtype（hook 注册在模块上，prepare 不剥离）。
+#   WanRMSNorm 不动：它是 `self._norm(x.float()).type_as(x) * self.weight`，bf16 weight
+#   乘在 type_as 之后，不会触发 F.layer_norm 那种 dtype 错。
+
+
+def _patch_wanlayernorm_forward():
+    """运行时 monkeypatch `WanLayerNorm.forward`，使其不依赖权重实际 dtype（deepspeed 友好）。
+
+    refs 原实现 `super().forward(x.float()).type_as(x)` 会走 `F.layer_norm(x.float(),
+    shape, self.weight, self.bias, eps)`——若 self.weight 被 deepspeed 压成 bf16，则
+    float32 input vs bf16 weight 崩。这里改成用 weight/bias 的 **float32 临时副本** 计算，
+    不修改权重本身（deepspeed prepare 之后权重仍是 bf16，但 forward 临时转 float32 算）。
+
+    幂等 guard（`WanLayerNorm._v5_dtype_safe`）防重复 patch。
+    """
+    if getattr(WanLayerNorm, "_v5_dtype_safe", False):
+        return False
+
+    def _safe_wanlayernorm_forward(self, x):
+        w = self.weight.float() if self.weight is not None else None
+        b = self.bias.float() if self.bias is not None else None
+        return F.layer_norm(
+            x.float(), self.normalized_shape, w, b, self.eps
+        ).type_as(x)
+
+    WanLayerNorm.forward = _safe_wanlayernorm_forward
+    WanLayerNorm._v5_dtype_safe = True
+    return True
+
+
+# import 时立即装 monkeypatch（确保 prepare 之前 patch 已生效；幂等）。
+_patch_wanlayernorm_forward()
+
 
 def _cast_pre_hook(module, args):
     """forward_pre_hook：把 input[0] cast 到 module.weight.dtype（已同 dtype 则原样）。"""
@@ -81,22 +118,19 @@ def _cast_pre_hook(module, args):
 def _make_dtype_robust(model: "WanModelWithMemoryV5"):
     """让骨干 forward 不依赖 autocast 也类型自洽（在 model.to(dtype) 之后调用）。
 
-    (A) 所有 norm 模块（WanLayerNorm/WanRMSNorm/torch.nn.LayerNorm）权重 → float32。
-        memory_encoder 内部的 LayerNorm 也会被覆盖到——无害（float32 norm 更稳），
-        但只转 norm 类模块，memory_encoder 的非-norm 权重（Linear/in_proj）不被误转。
+    (A) monkeypatch `WanLayerNorm.forward`（运行时，deepspeed 撤不掉）——forward 内用
+        weight/bias 的 float32 临时副本算 layer_norm，再 type_as(x) 转回；不改权重实际
+        dtype（deepspeed prepare 把权重压回 bf16 也不影响）。**不再静态 cast norm 权重**
+        （会被 deepspeed bf16 init 撤销，无效）。WanRMSNorm 不动（见模块头注释）。
     (B) 对骨干的 Linear/Conv3d（满足排除条件的）挂 forward_pre_hook，把输入 cast 到
         自己权重 dtype。排除：time_embedding / time_projection（需保持 float32 产出 e，
         挂了会把 e 变 bf16 触发 assert）、memory_encoder（自身 forward 已对齐 dtype）。
-        norm 类模块本就不是 Linear/Conv3d，不会被选中。
+        hook 注册在模块上，deepspeed prepare 不剥离。
 
     返回挂上的 hook 句柄列表（也存在 model._dtype_robust_hooks 上，确保不被 GC）。
     """
-    # ---- (A) norm 权重 → float32 ----
-    n_norm = 0
-    for m in model.modules():
-        if isinstance(m, (WanRMSNorm, WanLayerNorm, torch.nn.LayerNorm)):
-            m.float()  # 只把 norm 类模块的 param/buffer cast 到 float32
-            n_norm += 1
+    # ---- (A) 确保 WanLayerNorm.forward 已被 monkeypatch（幂等；import 时已装，这里兜底）----
+    _patch_wanlayernorm_forward()
 
     # ---- (B) Linear/Conv3d 挂 forward_pre_hook（带排除）----
     handles = []
@@ -116,10 +150,10 @@ def _make_dtype_robust(model: "WanModelWithMemoryV5"):
     model._dtype_robust_hooks = handles
 
     logger.info(
-        "_make_dtype_robust: norm→float32 %d 个（WanLayerNorm/WanRMSNorm/LayerNorm，"
-        "含 memory_encoder 内部 LayerNorm，无害）；挂 forward_pre_hook %d 个"
+        "_make_dtype_robust: WanLayerNorm.forward 已 monkeypatch（float32 临时副本算 "
+        "layer_norm，deepspeed 友好；WanRMSNorm 不动）；挂 forward_pre_hook %d 个"
         "（骨干 Linear/Conv3d；已排除 time_embedding/time_projection/memory_encoder）。",
-        n_norm, n_hook,
+        n_hook,
     )
     return handles
 
