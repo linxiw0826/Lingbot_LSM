@@ -3,7 +3,9 @@ model_with_memory_v5.py — WanModel + v5 in-context KV 记忆（experiment_desi
 
 `WanModelWithMemoryV5(WanModel)`：把指定 blocks 的 self_attn 替换为 MemorySelfAttention
 （保留骨干权重），并挂一个唯一可训练件 MemoryEncoder。forward 时把检索帧 latent 编码成
-memory token，逐层 set_memory，跑骨干 super().forward，再在 finally 里统一 clear_memory。
+memory token，**在 forward 开头对所有注入层一律 set_memory(mem 或 None)**，再跑骨干
+super().forward。**不在 finally clear_memory**：stash 留到下一次 forward 覆盖，使梯度检查点
+（use_reentrant=False）的 backward 重算期间仍能读到本步 mem（重算正确、不串味）。
 
 设计依据（已锁定）：
   - decisions.md「讨论 8」+ open_problems.md「OP-5」：v5 锁定方案（in-context KV、无 gate、
@@ -246,27 +248,34 @@ class WanModelWithMemoryV5(WanModel):
         Returns:
             与 WanModel.forward 相同：List[Tensor]，每项 [C_out, F, H/8, W/8]
         """
-        injected = False
+        # ---- stash（梯度检查点 use_reentrant=False 重算友好版）----
+        # 关键改动（OOM 修法）：v5 全冻骨干 → 必须对所有 block 强制梯度检查点（重算激活），
+        # 检查点 backward 会**重算 block.forward**，重算时 self_attn 会再读 self._mem_tokens。
+        #   旧实现在 finally 里 clear_memory()，导致 backward 重算时 mem 已被清成 None →
+        #   注入丢失、激活与前向不一致、梯度错。
+        # 新实现：
+        #   (1) forward 开头对**所有** _memory_layers 一律 set_memory(mem 或 None)——
+        #       注入时 set(本步 mem)，不注入时 set(None)。既反映本步、又覆盖上一步残留
+        #       （无串味），且不依赖 finally。
+        #   (2) **去掉 finally 的 clear_memory()**：stash 留到下一次 forward 覆盖，
+        #       backward 重算期间仍读得到本步 mem（梯度检查点重算正确）。
+        # mem 仍按现状 reshape 成 [1, K*gg, dim]（注入路径按 B=1 设计）。
         if memory_latents is not None:
             # latent → memory token：[K, gg, dim]
             mem = self.memory_encoder(memory_latents)          # [K, gg, dim]
             K, gg, dim = mem.shape
             # reshape 成 [1, K*gg, dim]（注入路径按 B=1 设计）
             mem = mem.reshape(1, K * gg, dim)
-            for i in self._memory_layers:
-                self.blocks[i].self_attn.set_memory(mem)
-            injected = True
+        else:
+            mem = None
 
-        try:
-            out = super().forward(
-                x, t, context, seq_len, y=y, dit_cond_dict=dit_cond_dict
-            )
-        finally:
-            # R6：无论是否异常，对所有注入层统一 clear（杜绝串味、保护梯度检查点重算）
-            if injected:
-                for i in self._memory_layers:
-                    self.blocks[i].self_attn.clear_memory()
+        # 对所有注入层一律设置（mem 或 None）：反映本步、覆盖残留、无需 finally clear。
+        for i in self._memory_layers:
+            self.blocks[i].self_attn.set_memory(mem)
 
+        out = super().forward(
+            x, t, context, seq_len, y=y, dit_cond_dict=dit_cond_dict
+        )
         return out
 
     # ------------------------------------------------------------------

@@ -84,6 +84,7 @@ import logging
 import os
 import random
 import sys
+from functools import wraps
 from os.path import abspath, dirname, join
 from typing import Dict, List, Optional, Tuple
 
@@ -126,6 +127,112 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# v5 专用梯度检查点（强制全 block，use_reentrant=False，OOM 修法）
+# ============================================================
+
+def enable_gradient_checkpointing_v5(model: nn.Module) -> int:
+    """对 v5 的**每个** backbone block 强制启用梯度检查点（不因 requires_grad 跳过）。
+
+    背景（OOM 根因）：v5 全冻骨干 → block 内无 requires_grad 参数 → v4 的
+    `enable_gradient_checkpointing`（line ~633 `if not any(p.requires_grad ...): continue`）
+    对 40 个 block 全跳过 → no-op → 40 层 FFN 中间激活（~4×dim/层）全驻留 → 爆 95GB。
+    修法：对**所有** block 强制 checkpoint，backward 时重算激活、不驻留 → 释放约 50GB。
+
+    与 v4 函数的关键区别：
+      1. **去掉 requires_grad 跳过**：对每个 block 一律 patch。
+      2. **use_reentrant=False**：在「block 输入不 require grad（全冻骨干）」下仍能正确建反
+         传图到 memory_encoder；且与 ZeRO-3 in-place 参数释放、stash 副信道兼容更好
+         （reentrant=True 需输入 require grad 才建图，正是 v4 Exp0 要手动 x.requires_grad_
+         的原因；非 reentrant 用 saved-tensor-hook，无此约束）。
+      3. **显式把 mem 传入被 checkpoint 的函数**（最稳）：memory 本通过 self_attn 的 stash
+         副信道（block.self_attn._mem_tokens）进入 block，不是 block.forward 的显式参数。
+         为确保 backward 重算时拿到的 mem 是「本步、且 require grad、且能连回 memory_encoder」
+         的同一张量，这里在 wrap 内**先读出本步 stash 的 mem**，把它作为 checkpoint 的**显式
+         入参**传进去；被 checkpoint 的内层函数在重算时用该 mem 重新 set_memory 再跑原 forward。
+         这样 mem 成为 checkpoint 的被追踪输入 → 非 reentrant 的 saved-tensor 机制会在重算时
+         喂回**完全相同**的 mem 张量，其上游（memory_encoder）的反传图不会断。
+
+    梯度为何能到 memory_encoder：
+      - mem = memory_encoder(...) 在**checkpoint 区域之外**算好（在 model.forward 里，
+        super().forward 之前），是一个 require-grad 的中间张量。
+      - 它作为 checkpoint(fn, x, ..., mem) 的显式输入；checkpoint 前向只存输入、丢中间激活。
+      - backward 时 checkpoint 用**保存的同一 mem 张量**重算 fn → 内层 set_memory(mem) →
+        block.self_attn 用 self.k(mem)/self.v(mem) 重建注意力 → 重算激活的反传图连到 mem →
+        mem 再连回 memory_encoder 的参数 → 梯度正确回流到唯一可训练件。
+      - block 的冻结参数无 grad（无所谓），但 x（block 输入）与 mem 的 grad 会沿链路传播；
+        非 reentrant checkpoint 不要求输入 require grad 即可正确建图。
+
+    返回 patch 的 block 数量。
+    """
+    from torch.utils.checkpoint import checkpoint as torch_checkpoint
+
+    # 找 block 容器（同 v4 探测逻辑）
+    block_container = None
+    for attr in ['blocks', 'layers', 'transformer_blocks']:
+        if hasattr(model, attr):
+            block_container = getattr(model, attr)
+            break
+    if block_container is None:
+        for _name, mod in model.named_modules():
+            if isinstance(mod, torch.nn.ModuleList) and len(mod) >= 10:
+                block_container = mod
+                break
+    if block_container is None:
+        logging.warning("v5 gradient checkpointing: could not find DiT blocks, skipping")
+        return 0
+
+    patched = 0
+    for block in block_container:
+        orig_forward = block.forward
+
+        def _make_ckpt_fn(module, fn):
+            # _in_ckpt 防无限递归：_ckpt_forward → checkpoint(_run) → fn（直接）。
+            _in_ckpt = [False]
+
+            @wraps(fn)
+            def _ckpt_forward(x, e, seq_lens, grid_sizes, freqs,
+                              context, context_lens, dit_cond_dict=None):
+                if _in_ckpt[0]:
+                    return fn(x, e, seq_lens, grid_sizes, freqs,
+                              context, context_lens, dit_cond_dict)
+
+                # 读出本步 stash 的 mem（model.forward 已在 super().forward 前 set 好；
+                # 注入时为本步 require-grad 张量，不注入时为 None）。把它作为 checkpoint
+                # 的显式入参，确保重算时喂回同一张量、梯度连回 memory_encoder。
+                self_attn = getattr(module, "self_attn", None)
+                mem = getattr(self_attn, "_mem_tokens", None) if self_attn is not None else None
+
+                def _run(x, e, seq_lens, grid_sizes, freqs,
+                         context, context_lens, dit_cond_dict, mem):
+                    _in_ckpt[0] = True
+                    try:
+                        # 重算时用显式传入的 mem 重新 set（防 stash 在重算时被其它步覆盖）。
+                        if self_attn is not None:
+                            self_attn.set_memory(mem)
+                        return fn(x, e, seq_lens, grid_sizes, freqs,
+                                  context, context_lens, dit_cond_dict)
+                    finally:
+                        _in_ckpt[0] = False
+
+                # use_reentrant=False：冻结输入下仍正确建反传图；mem 作显式输入被追踪。
+                return torch_checkpoint(
+                    _run, x, e, seq_lens, grid_sizes, freqs,
+                    context, context_lens, dit_cond_dict, mem,
+                    use_reentrant=False,
+                )
+            return _ckpt_forward
+
+        block.forward = _make_ckpt_fn(block, orig_forward)
+        patched += 1
+
+    logging.info(
+        "v5 gradient checkpointing: 强制 patch %d 个 block（use_reentrant=False，mem 显式入参）。",
+        patched,
+    )
+    return patched
 
 
 # ============================================================
@@ -941,14 +1048,13 @@ def main():
 
     trainable_params = [p for _, p in trainable_named]
 
-    # ---- 梯度检查点（I1 修正注释）：v4 的 enable_gradient_checkpointing 只对
-    #      requires_grad 的 block 打 patch。v5 全冻骨干 → 所有 40 个 block 均
-    #      requires_grad=False → **此调用对每个 block 都跳过，实为 no-op**（不省显存）。
-    #      因此 40 层骨干的前向激活图为反传 memory_encoder **全部保留在显存**，无任何
-    #      重算节省；服务器上需对此 OOM 风险保持关注（grid/depth/seq_len 偏大时尤甚）。
-    #      此处保留调用仅为与 v4 脚手架对齐，不改变行为。
+    # ---- 梯度检查点（OOM 修法）：必须用 v5 专用 enable_gradient_checkpointing_v5。
+    #      v4 的 enable_gradient_checkpointing 因 `if not any(p.requires_grad ...): continue`
+    #      会对 v5 全冻骨干的所有 40 个 block 跳过 → no-op → 40 层 FFN 激活全驻留 → OOM。
+    #      v5 版强制对**每个** block 用 use_reentrant=False 检查点（重算激活、不驻留），
+    #      并把 stash 的 mem 作显式入参传入 → backward 重算正确、梯度回流 memory_encoder。
     if args.gradient_checkpointing:
-        enable_gradient_checkpointing(model)
+        enable_gradient_checkpointing_v5(model)
 
     # ---- 数据集（复用 v4 CSGOMultiClipDataset / collate）----
     dataset = CSGOMultiClipDataset(
