@@ -11,15 +11,29 @@ set -euo pipefail
 #
 # 必填：MEMORY_ENCODER_CKPT —— 训练产出的 memory_encoder.pth（train_v5 save_memory_encoder）。
 #
-# 可用环境变量覆盖（无需编辑本文件）：
-#   CUDA_VISIBLE_DEVICES / MEMORY_ENCODER_CKPT / IMAGE / ACTION_PATH / SAVE_FILE
-#   PROMPT / NUM_CLIPS / FRAME_NUM / SIZE / SAMPLE_STEPS / GUIDE_SCALE / SEED / FPS
-#   TAG / RUN_NAME / GRID / ENCODER_DEPTH / OUTPUT_ROOT
+# 两种数据入口（二选一，additive）：
+#   A. action_path 模式（默认）：IMAGE + ACTION_PATH（含 poses/action/intrinsics.npy）。
+#   B. episode 模式（demo 用，设 EPISODE_ID 即开）：直接取重访数据集整条 episode，
+#      首帧=frames[0]、poses/actions/intrinsics 来自 ep.*，不落 poses.npy。
+#      EPISODE_ID=first/top = 取 metadata CSV 按 revisit_quality 排序后的第一个 ep。
 #
-# 示例（指定权重 + 首帧 + 动作轨迹，单卡 0）：
+# 可用环境变量覆盖（无需编辑本文件）：
+#   CUDA_VISIBLE_DEVICES / MEMORY_ENCODER_CKPT / OUTPUT_ROOT
+#   --- action_path 模式 ---：IMAGE / ACTION_PATH / SAVE_FILE
+#   --- episode 模式（设 EPISODE_ID 触发）---：EPISODE_ID / DATASET_DIR / METADATA
+#   PROMPT / NUM_CLIPS / FRAME_NUM / SIZE / SAMPLE_STEPS / GUIDE_SCALE / SEED / FPS
+#   TAG / RUN_NAME / GRID / ENCODER_DEPTH
+#
+# 示例 A（action_path 模式：指定权重 + 首帧 + 动作轨迹，单卡 0）：
 #   MEMORY_ENCODER_CKPT=/home/nvme02/wlx/Memory/outputs/v5/train/<run>/epoch_3/memory_encoder.pth \
 #     IMAGE=/data/clip_000/image.jpg \
 #     ACTION_PATH=/data/clip_000 \
+#     bash src/scripts/v5/run_infer_v5.sh
+# 示例 B（episode 模式：取最高质量重访 ep，单卡 0）：
+#   EPISODE_ID=first \
+#     DATASET_DIR=/home/nvme02/Memory-dataset/v4_dynamic_xxx \
+#     METADATA=metadata_verify_train.csv \
+#     MEMORY_ENCODER_CKPT=/home/nvme02/wlx/Memory/outputs/v5/train/<run>/epoch_3/memory_encoder.pth \
 #     bash src/scripts/v5/run_infer_v5.sh
 # 示例（换卡）：
 #   CUDA_VISIBLE_DEVICES=2 MEMORY_ENCODER_CKPT=.../memory_encoder.pth \
@@ -30,9 +44,14 @@ set -euo pipefail
 CKPT_DIR="/home/nvme02/lingbot-world/models/lingbot-world-base-act"     # lingbot-world 预训练权重
 MEMORY_ENCODER_CKPT="${MEMORY_ENCODER_CKPT:-}"                          # 必填：训练好的 memory_encoder.pth
 
-# ---- 数据（走环境变量 + 合理默认）----
+# ---- 数据（走环境变量 + 合理默认；action_path 模式 或 episode 模式 二选一）----
+# action_path 模式（EPISODE_ID 为空时用）
 IMAGE="${IMAGE:-/home/nvme02/Memory-dataset/demo/clip_000/image.jpg}"              # 首帧图像
 ACTION_PATH="${ACTION_PATH:-/home/nvme02/Memory-dataset/demo/clip_000}"            # 含 poses/action/intrinsics.npy
+# episode 模式（EPISODE_ID 非空时用；first/top = metadata CSV 第一个 ep）
+EPISODE_ID="${EPISODE_ID:-}"                                              # 空=action_path 模式；非空=episode 模式
+DATASET_DIR="${DATASET_DIR:-}"                                            # episode 模式必填：含 metadata CSV + clips/ 的数据集根
+METADATA="${METADATA:-metadata_verify_train.csv}"                         # 相对 dataset_dir 的 CSV
 SAVE_FILE="${SAVE_FILE:-}"                                              # 空 → 落 infer_run_dir/long_video.mp4
 
 # ---- 生成参数 ----
@@ -65,7 +84,7 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export TMPDIR=/tmp                       # 防 pymp/torchelastic 孤儿落进 repo
 export CUDA_DEVICE_ORDER=PCI_BUS_ID      # 卡号按 PCI 总线序
 
-# ---------- 路径检查 ----------
+# ---------- 路径检查（action_path 模式 / episode 模式 分别校验）----------
 _err=0
 if [ -z "${CKPT_DIR}" ]; then
     echo "[ERROR] CKPT_DIR 未设置" >&2; _err=1
@@ -73,25 +92,43 @@ fi
 if [ -z "${MEMORY_ENCODER_CKPT}" ]; then
     echo "[ERROR] MEMORY_ENCODER_CKPT 未设置（必填：传环境变量 MEMORY_ENCODER_CKPT=.../memory_encoder.pth）" >&2; _err=1
 fi
-if [ -z "${IMAGE}" ]; then
-    echo "[ERROR] IMAGE 未设置（首帧图像路径）" >&2; _err=1
-fi
-if [ -z "${ACTION_PATH}" ]; then
-    echo "[ERROR] ACTION_PATH 未设置（含 poses.npy/action.npy/intrinsics.npy 的目录）" >&2; _err=1
-fi
-if [ "${_err}" -ne 0 ]; then exit 1; fi
 
-if [ ! -f "${IMAGE}" ]; then
-    echo "[ERROR] 首帧图像不存在：${IMAGE}" >&2; exit 1
-fi
-if [ ! -d "${ACTION_PATH}" ]; then
-    echo "[ERROR] action_path 不是目录：${ACTION_PATH}" >&2; exit 1
-fi
-for _need in poses.npy action.npy intrinsics.npy; do
-    if [ ! -f "${ACTION_PATH}/${_need}" ]; then
-        echo "[ERROR] ${ACTION_PATH}/${_need} 不存在" >&2; exit 1
+if [ -n "${EPISODE_ID}" ]; then
+    # ---- episode 模式：要 DATASET_DIR（+ METADATA 非空），不要 IMAGE/ACTION_PATH ----
+    if [ -z "${DATASET_DIR}" ]; then
+        echo "[ERROR] episode 模式（EPISODE_ID 非空）要求 DATASET_DIR（含 metadata CSV + clips/ 的数据集根）" >&2; _err=1
     fi
-done
+    if [ -z "${METADATA}" ]; then
+        echo "[ERROR] episode 模式要求 METADATA 非空（相对 dataset_dir 的 CSV）" >&2; _err=1
+    fi
+    if [ "${_err}" -ne 0 ]; then exit 1; fi
+    if [ ! -d "${DATASET_DIR}" ]; then
+        echo "[ERROR] DATASET_DIR 不是目录：${DATASET_DIR}" >&2; exit 1
+    fi
+    if [ ! -f "${DATASET_DIR}/${METADATA}" ]; then
+        echo "[ERROR] metadata CSV 不存在：${DATASET_DIR}/${METADATA}" >&2; exit 1
+    fi
+else
+    # ---- action_path 模式（原口径）：要 IMAGE + ACTION_PATH ----
+    if [ -z "${IMAGE}" ]; then
+        echo "[ERROR] IMAGE 未设置（首帧图像路径）" >&2; _err=1
+    fi
+    if [ -z "${ACTION_PATH}" ]; then
+        echo "[ERROR] ACTION_PATH 未设置（含 poses.npy/action.npy/intrinsics.npy 的目录）" >&2; _err=1
+    fi
+    if [ "${_err}" -ne 0 ]; then exit 1; fi
+    if [ ! -f "${IMAGE}" ]; then
+        echo "[ERROR] 首帧图像不存在：${IMAGE}" >&2; exit 1
+    fi
+    if [ ! -d "${ACTION_PATH}" ]; then
+        echo "[ERROR] action_path 不是目录：${ACTION_PATH}" >&2; exit 1
+    fi
+    for _need in poses.npy action.npy intrinsics.npy; do
+        if [ ! -f "${ACTION_PATH}/${_need}" ]; then
+            echo "[ERROR] ${ACTION_PATH}/${_need} 不存在" >&2; exit 1
+        fi
+    done
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
@@ -105,12 +142,10 @@ LOG_DIR="${PROJECT_ROOT}/logs/$(basename "${BASH_SOURCE[0]}" .sh)"
 mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/$(date +%Y%m%d_%H%M%S).log"
 
-# ---------- 参数数组 ----------
+# ---------- 参数数组（action_path 模式 vs episode 模式 数据入口不同）----------
 INFER_ARGS=(
     --ckpt_dir              "${CKPT_DIR}"
     --memory_encoder_ckpt   "${MEMORY_ENCODER_CKPT}"
-    --image                 "${IMAGE}"
-    --action_path           "${ACTION_PATH}"
     --prompt                "${PROMPT}"
     --num_clips             "${NUM_CLIPS}"
     --frame_num             "${FRAME_NUM}"
@@ -122,6 +157,20 @@ INFER_ARGS=(
     --fps                   "${FPS}"
     --tag                   "${TAG}"
 )
+if [ -n "${EPISODE_ID}" ]; then
+    # episode 模式：episode 三参替代 --image/--action_path
+    INFER_ARGS+=(
+        --episode_id        "${EPISODE_ID}"
+        --dataset_dir       "${DATASET_DIR}"
+        --metadata          "${METADATA}"
+    )
+else
+    # action_path 模式（原口径）
+    INFER_ARGS+=(
+        --image             "${IMAGE}"
+        --action_path       "${ACTION_PATH}"
+    )
+fi
 
 # save_file：空 → infer_v5 默认落 infer_run_dir/long_video.mp4
 if [ -n "${SAVE_FILE}" ]; then
@@ -143,8 +192,16 @@ fi
 echo "====================================================="
 echo "  LingBot-World Memory v5 推理启动（多 clip 长视频 demo）"
 echo "  MEMORY_ENCODER_CKPT : ${MEMORY_ENCODER_CKPT}"
-echo "  IMAGE               : ${IMAGE}"
-echo "  ACTION_PATH         : ${ACTION_PATH}"
+if [ -n "${EPISODE_ID}" ]; then
+    echo "  模式                : episode（--episode_id）"
+    echo "  EPISODE_ID          : ${EPISODE_ID}"
+    echo "  DATASET_DIR         : ${DATASET_DIR}"
+    echo "  METADATA            : ${METADATA}"
+else
+    echo "  模式                : action_path（默认）"
+    echo "  IMAGE               : ${IMAGE}"
+    echo "  ACTION_PATH         : ${ACTION_PATH}"
+fi
 echo "  SAVE_FILE           : ${SAVE_FILE:-<infer_run_dir/long_video.mp4>}"
 echo "  NUM_CLIPS           : ${NUM_CLIPS}"
 echo "  FRAME_NUM           : ${FRAME_NUM}"
