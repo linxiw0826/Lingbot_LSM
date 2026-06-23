@@ -50,6 +50,7 @@ IMAGE="${IMAGE:-/home/nvme02/Memory-dataset/demo/clip_000/image.jpg}"           
 ACTION_PATH="${ACTION_PATH:-/home/nvme02/Memory-dataset/demo/clip_000}"            # 含 poses/action/intrinsics.npy
 # episode 模式（EPISODE_ID 非空时用；first/top = metadata CSV 第一个 ep）
 EPISODE_ID="${EPISODE_ID:-}"                                              # 空=action_path 模式；非空=episode 模式
+NO_MEMORY="${NO_MEMORY:-}"                                            # 空=memory on(v5);非空=off(lingbot base 对照)
 DATASET_DIR="${DATASET_DIR:-}"                                            # episode 模式必填：含 metadata CSV + clips/ 的数据集根
 METADATA="${METADATA:-metadata_verify_train.csv}"                         # 相对 dataset_dir 的 CSV
 SAVE_FILE="${SAVE_FILE:-}"                                              # 空 → 落 infer_run_dir/long_video.mp4
@@ -188,6 +189,9 @@ if [ -n "${ENCODER_DEPTH}" ]; then
     INFER_ARGS+=(--encoder_depth "${ENCODER_DEPTH}")
 fi
 # 默认 low-only：不加 --inject_high。
+if [ -n "${NO_MEMORY}" ]; then
+    INFER_ARGS+=(--no_memory)
+fi
 
 echo "====================================================="
 echo "  LingBot-World Memory v5 推理启动（多 clip 长视频 demo）"
@@ -203,6 +207,7 @@ else
     echo "  ACTION_PATH         : ${ACTION_PATH}"
 fi
 echo "  SAVE_FILE           : ${SAVE_FILE:-<infer_run_dir/long_video.mp4>}"
+echo "  NO_MEMORY          : ${NO_MEMORY:-<空=memory on (v5)>}"
 echo "  NUM_CLIPS           : ${NUM_CLIPS}"
 echo "  FRAME_NUM           : ${FRAME_NUM}"
 echo "  SIZE                : ${SIZE}"

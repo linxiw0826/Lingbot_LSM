@@ -170,6 +170,8 @@ def _parse_args():
     p.add_argument("--inject_high", action="store_true", default=False,
                    help="默认 False=只把 low_noise_model 转 V5 + 注入（对齐训练，只训了 low 的 "
                         "memory_encoder；high 用未训练对齐的 encoder 仅消融，会污染主判读，慎用）。")
+    p.add_argument("--no_memory", action="store_true", default=False,
+                   help="关闭 memory 注入:不检索/不注入/不更新 bank = 纯 base i2v 自回归生成,等同 lingbot-world 原模型(用于 base 对照)。默认 False(原 v5 行为:memory on)。")
 
     # ---- 生成参数 ----
     p.add_argument("--prompt", type=str,
@@ -613,9 +615,9 @@ def main():
             )
         poses_tensor = torch.from_numpy(clip_poses).float()
 
-        # b. 检索记忆（仅 clip_idx>0，bank 非空时）
+        # b. 检索记忆（仅 clip_idx>0 且非 --no_memory，bank 非空时）
         memory_latents: Optional[torch.Tensor] = None
-        if clip_idx > 0:
+        if clip_idx > 0 and not args.no_memory:
             # query_location = 本 clip 第一个 latent 帧的绝对位置（与 train_v5 target 口径一致）
             #   train_v5 用 lat_f（=video_latent.shape[1]）计算 locations；此处用 frame_num 估
             #   的 lat_f 上界（每 4 帧一 latent），取 locations[0] 即可（首帧位置不依赖 lat_f）。
@@ -634,6 +636,9 @@ def main():
                 "Clip %d: retrieved %d memory frames (revisit_top_k=%d, min_gap=%d).",
                 clip_idx + 1, _k, args.revisit_top_k, args.revisit_min_gap_frames,
             )
+        elif args.no_memory:
+            logger.info("Clip %d: --no_memory, pure base i2v (lingbot base 对照, 无 memory).",
+                        clip_idx + 1)
         else:
             logger.info("Clip 1: pure i2v startup (memory_latents=None, bank empty).")
 
@@ -678,16 +683,18 @@ def main():
         all_videos.append(torch.from_numpy(video_np.copy()))
 
         # d. bank 更新（surprise-independent，对齐 train_v5 context-clip 循环）
-        global_t = _update_bank_from_clip(
-            bank=bank,
-            video=video_np,
-            wan_i2v=wan_i2v,
-            device=device,
-            poses_clip=poses_tensor,
-            global_t_start=global_t,
-            dim=dim,
-            clip_idx=clip_idx,
-        )
+        #    --no_memory 时跳过:省 VAE encode,且 base 对照无需 bank。
+        if not args.no_memory:
+            global_t = _update_bank_from_clip(
+                bank=bank,
+                video=video_np,
+                wan_i2v=wan_i2v,
+                device=device,
+                poses_clip=poses_tensor,
+                global_t_start=global_t,
+                dim=dim,
+                clip_idx=clip_idx,
+            )
 
         # e. 最后一帧作为下一 clip 的初始帧（autoregressive 链接，对齐 v4 current_img）
         last_frame_chw = video_np[:, -1]  # [C=3, H, W]
