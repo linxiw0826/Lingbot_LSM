@@ -100,6 +100,28 @@ def eval_run_dir(version: str, run_name: str, tag: str) -> Path:
     return run_dir
 
 
+def infer_run_dir(version: str, run_name: str, tag: str) -> Path:
+    """Return (creating if needed) the directory for one inference (demo) run.
+
+    Additive helper mirroring :func:`eval_run_dir`, for long-video / demo
+    generation runs (e.g. v5 multi-clip natural-quality generation). Layout:
+    ``OUTPUT_ROOT/<version>/infer/<run_name>/<tag>/``. Unlike eval, no
+    ``videos/`` subdir is pre-created — the inference script itself writes the
+    mp4 + log + config snapshot directly into ``run_dir``.
+
+    Args:
+        version: Pipeline version namespace, e.g. ``"v5"``.
+        run_name: Unique run identifier, e.g. from :func:`default_run_name`.
+        tag: Inference scenario tag, e.g. ``"long_video"``.
+
+    Returns:
+        Path to the infer directory (already exists on return).
+    """
+    run_dir = OUTPUT_ROOT / version / "infer" / run_name / tag
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
 def snapshot_config(run_dir: Path, config: dict) -> Path:
     """Dump ``config`` next to a run's outputs as a config snapshot.
 

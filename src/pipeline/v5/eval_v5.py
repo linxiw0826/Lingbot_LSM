@@ -188,6 +188,15 @@ def _parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--fps", type=int, default=16)
 
+    # ---- 分片（additive：shard_count 默认 1 → 逐字节与改前一致）----
+    # 多卡并行 eval 用：每个 shard 跑不同子集，各自写独立 run_dir（不同 --tag），
+    # 跑完用 merge_eval_shards.py 合并 per_window.csv。单卡场景不传这两个参数即可。
+    p.add_argument("--shard_index", type=int, default=0,
+                   help="当前分片索引（0-based），多卡并行 eval 用。默认 0。")
+    p.add_argument("--shard_count", type=int, default=1,
+                   help="总分片数。默认 1=不分片（逐字节与单进程一致）；"
+                        ">1 时本进程只处理 ep_ids[shard_index::shard_count]。")
+
     return p.parse_args()
 
 
@@ -680,6 +689,18 @@ def main():
     if not ep_ids:
         logger.error("无 episode 可处理，退出。")
         return
+
+    # ---- 分片（additive：shard_count 默认 1 → ep_ids 不变，逐字节兼容）----
+    # 多卡并行 eval：先按 max_episodes 截断全集，再 [shard_index::shard_count] 切片，
+    # 保证各 shard 合起来正好是全集的前 max_episodes 个（无重叠、无遗漏）。
+    if getattr(args, "shard_count", 1) > 1:
+        ep_ids = ep_ids[args.shard_index :: args.shard_count]
+        logger.info("eval shard %d/%d: 本分片处理 %d 个 episode",
+                    args.shard_index, args.shard_count, len(ep_ids))
+        if not ep_ids:
+            logger.error("shard %d/%d 分到 0 个 episode（全集太小？），退出。",
+                         args.shard_index, args.shard_count)
+            return
 
     # ---- 加载 v5 pipeline ----
     wan_i2v = _load_v5_pipeline(args, device)
