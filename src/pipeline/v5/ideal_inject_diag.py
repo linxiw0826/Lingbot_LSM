@@ -413,36 +413,76 @@ def _capture_layer_kv(wan_i2v, model, frames, ep, mem_frame: int,
 # 注入上下文（按臂切来源开关；finally 一律复位 encoder，杜绝串味）
 # ===========================================================================
 
+def _high_v5_model(wan_i2v, model, inject_high: bool):
+    """返回需与 low 同步配置 mem_source 的 high V5 模型；否则 None。
+
+    W-1：仅当 `--inject_high` 且 high_noise_model 已转 V5（WanModelWithMemoryV5、与 low 同有
+    set_mem_source / set_layer_kv_cache 开关）时返回 high；否则（默认 low-only，或 high 仍是原始
+    WanModel）返回 None。**inject_high=False 时恒返回 None**——保证默认 low-only 路径逐位不变。
+    """
+    if not inject_high:
+        return None
+    from memory_module.v5_incontext.model_with_memory_v5 import WanModelWithMemoryV5
+    high = getattr(wan_i2v, "high_noise_model", None)
+    if high is not None and high is not model and isinstance(high, WanModelWithMemoryV5):
+        return high
+    return None
+
+
 @contextmanager
 def _arm_injection(wan_i2v, model, arm: str,
                    cache_ideal: Optional[Dict[int, torch.Tensor]],
                    cache_random: Optional[Dict[int, torch.Tensor]],
-                   oracle_latent: Optional[torch.Tensor]):
-    """generate 期间按臂设置 memory 来源；退出时复位为 'encoder' + 清缓存/还原 patch。"""
+                   oracle_latent: Optional[torch.Tensor],
+                   inject_high: bool = False):
+    """generate 期间按臂设置 memory 来源；退出时复位为 'encoder' + 清缓存/还原 patch。
+
+    W-1：`--inject_high` 下 high 也转了 V5，且 `_patch_memory_latents` 会把 oracle_latent 绑进
+    **所有**已转 V5 模型（含 high）的 forward。若不同步切 high 的来源，high 会对注入的内容走惰性
+    encoder 分支，污染该臂贡献。故任一 ideal_* 臂在 inject_high 下都把 high 切到**同一来源**，
+    确保没有任何模型悄悄走 encoder 路径；finally 把 low/high 双双复位 encoder + 清 cache。
+    **inject_high=False 时 `high is None`，全部 high 分支跳过，行为与现状逐位等价。**
+    """
     if arm == "off":
         # 不注入：保持 encoder + 不 patch memory_latents → forward 所有层 set_memory(None)
         yield
         return
+    high = _high_v5_model(wan_i2v, model, inject_high)
     if arm in ("ideal_A", "random_A"):
         cache = cache_ideal if arm == "ideal_A" else cache_random
         model.set_layer_kv_cache(cache)
         model.set_mem_source("ideal_A")
+        # W-1：high 未捕获逐层 cache（cache 只对 low 捕获）→ 给 high 设 cache=None 并切 ideal_A 源，
+        #      使其 forward 走 ideal_A 分支对各层 set_memory(None)（不注入、不经 encoder），而非
+        #      对 None memory_latents 走 encoder 分支。
+        if high is not None:
+            high.set_layer_kv_cache(None)
+            high.set_mem_source("ideal_A")
         try:
             yield
         finally:
             model.set_mem_source("encoder")
             model.set_layer_kv_cache(None)
+            if high is not None:
+                high.set_mem_source("encoder")
+                high.set_layer_kv_cache(None)
         return
     if arm == "ideal_B":
         # 档 B：所有层共享 pool(patch_embedding(zero-padded latent))，经 _patch_memory_latents
         # 把 oracle_latent 绑进 forward 的 memory_latents，src=ideal_B 触发 _encode_ideal_B。
         model.set_mem_source("ideal_B")
+        # W-1：high 也被 _patch_memory_latents 绑进 oracle_latent → 必须把 high 也切到 ideal_B，
+        #      让它走 _encode_ideal_B(oracle_latent) 而非惰性 encoder 路径。
+        if high is not None:
+            high.set_mem_source("ideal_B")
         _patch_memory_latents(wan_i2v, oracle_latent)
         try:
             yield
         finally:
             _unpatch_memory_latents(wan_i2v)
             model.set_mem_source("encoder")
+            if high is not None:
+                high.set_mem_source("encoder")
         return
     raise ValueError(f"未知臂 {arm!r}")
 
@@ -460,7 +500,8 @@ def _generate_arm(wan_i2v, model, arm, cache_ideal, cache_random, oracle_latent,
     np.save(os.path.join(tmp_action_dir, "intrinsics.npy"), intr_c.astype(np.float32))
     max_area = MAX_AREA_CONFIGS[args.size]
 
-    with _arm_injection(wan_i2v, model, arm, cache_ideal, cache_random, oracle_latent):
+    with _arm_injection(wan_i2v, model, arm, cache_ideal, cache_random, oracle_latent,
+                        inject_high=args.inject_high):
         video = wan_i2v.generate(
             args.prompt, img, action_path=tmp_action_dir, max_area=max_area,
             frame_num=args.frame_num, shift=args.sample_shift, sample_solver="unipc",
