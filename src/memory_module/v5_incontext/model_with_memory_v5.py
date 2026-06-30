@@ -190,6 +190,15 @@ class WanModelWithMemoryV5(WanModel):
         self._grid = grid
         self._encoder_depth = encoder_depth
 
+        # ---- memory token 来源开关（S-V4 / Step 43：encoder-free ideal injection）----
+        # "encoder"（默认）：现状，mem = memory_encoder(memory_latents)，逐位不变（向后兼容硬要求）。
+        # "ideal_A"：逐层真实 KV-cache（self._layer_kv_cache 提供，每层不同），绕过 encoder。
+        # "ideal_B"：mem = pool(patch_embedding(zero-padded latent))，所有层共享，绕过 encoder。
+        # 见 decisions.md 讨论 9/10 + experiment_design Step 43。
+        self._mem_source: str = "encoder"
+        # 档 A 用：{layer_index: [1, L_mem, dim]} 逐层真实 KV-cache（CPU/GPU 均可，注入时对齐）。
+        self._layer_kv_cache: Optional[dict] = None
+
         # 将指定 blocks 的 self_attn 替换为 MemorySelfAttention（保留权重）。
         # 做法：新建同配置的 MemorySelfAttention，load_state_dict(old.state_dict())，
         #       再赋值替换。保证 q/k/v/o/norm_q/norm_k 权重零丢失。
@@ -237,46 +246,124 @@ class WanModelWithMemoryV5(WanModel):
         y=None,
         dit_cond_dict=None,
         memory_latents: Optional[Tensor] = None,
+        mem_source: Optional[str] = None,
     ):
-        """在 WanModel.forward 基础上支持 memory_latents 注入。
+        """在 WanModel.forward 基础上支持 memory 注入（三种来源开关）。
 
         Args:
             memory_latents: [K, z_dim, h, w]（检索帧 VAE latent）或 None。
-                            None 时行为与原始 WanModel 完全一致。
+                            None 时行为与原始 WanModel 完全一致（encoder/ideal_B 路径）。
+            mem_source:     memory token 来源开关，None → 用 self._mem_source（默认 "encoder"）。
+                            - "encoder"（默认）：mem = memory_encoder(memory_latents)，所有层
+                              共享；**memory_latents=None 时所有层 set_memory(None)**——与改造前
+                              逐位等价（向后兼容硬要求）。
+                            - "ideal_A"：逐层真实 KV-cache（self._layer_kv_cache，每层不同），
+                              不调 memory_encoder，忽略 memory_latents（S-V4 档 A）。
+                            - "ideal_B"：mem = pool(patch_embedding(zero-padded latent))，所有层
+                              共享，不调 memory_encoder（S-V4 档 B）。
             其余参数见 WanModel.forward。
 
         Returns:
             与 WanModel.forward 相同：List[Tensor]，每项 [C_out, F, H/8, W/8]
         """
         # ---- stash（梯度检查点 use_reentrant=False 重算友好版）----
-        # 关键改动（OOM 修法）：v5 全冻骨干 → 必须对所有 block 强制梯度检查点（重算激活），
-        # 检查点 backward 会**重算 block.forward**，重算时 self_attn 会再读 self._mem_tokens。
-        #   旧实现在 finally 里 clear_memory()，导致 backward 重算时 mem 已被清成 None →
-        #   注入丢失、激活与前向不一致、梯度错。
-        # 新实现：
-        #   (1) forward 开头对**所有** _memory_layers 一律 set_memory(mem 或 None)——
-        #       注入时 set(本步 mem)，不注入时 set(None)。既反映本步、又覆盖上一步残留
-        #       （无串味），且不依赖 finally。
-        #   (2) **去掉 finally 的 clear_memory()**：stash 留到下一次 forward 覆盖，
-        #       backward 重算期间仍读得到本步 mem（梯度检查点重算正确）。
-        # mem 仍按现状 reshape 成 [1, K*gg, dim]（注入路径按 B=1 设计）。
-        if memory_latents is not None:
-            # latent → memory token：[K, gg, dim]
-            mem = self.memory_encoder(memory_latents)          # [K, gg, dim]
-            K, gg, dim = mem.shape
-            # reshape 成 [1, K*gg, dim]（注入路径按 B=1 设计）
-            mem = mem.reshape(1, K * gg, dim)
-        else:
-            mem = None
+        # 关键（OOM 修法，"encoder" 路径不变）：v5 全冻骨干 → 对所有 block 强制梯度检查点
+        # （重算激活），检查点 backward 会**重算 block.forward**，重算时 self_attn 会再读
+        # self._mem_tokens。故 forward 开头对**所有** _memory_layers 一律 set_memory(mem 或
+        # None)（反映本步、覆盖上一步残留、无需 finally clear），stash 留到下一次 forward 覆盖。
+        src = mem_source if mem_source is not None else self._mem_source
 
-        # 对所有注入层一律设置（mem 或 None）：反映本步、覆盖残留、无需 finally clear。
-        for i in self._memory_layers:
-            self.blocks[i].self_attn.set_memory(mem)
+        if src == "encoder":
+            # ---- 现状（默认）：与改造前逐位等价 ----
+            if memory_latents is not None:
+                # latent → memory token：[K, gg, dim]
+                mem = self.memory_encoder(memory_latents)          # [K, gg, dim]
+                K, gg, dim = mem.shape
+                # reshape 成 [1, K*gg, dim]（注入路径按 B=1 设计）
+                mem = mem.reshape(1, K * gg, dim)
+            else:
+                mem = None
+            for i in self._memory_layers:
+                self.blocks[i].self_attn.set_memory(mem)
+
+        elif src == "ideal_B":
+            # ---- 档 B：mem = pool(patch_embedding(zero-padded latent))，所有层共享 ----
+            if memory_latents is not None:
+                mem = self._encode_ideal_B(memory_latents)         # [1, K*gg, dim]
+            else:
+                mem = None
+            for i in self._memory_layers:
+                self.blocks[i].self_attn.set_memory(mem)
+
+        elif src == "ideal_A":
+            # ---- 档 A：逐层真实 KV-cache（每层不同），忽略 memory_latents/encoder ----
+            cache = self._layer_kv_cache
+            for i in self._memory_layers:
+                m = None if cache is None else cache.get(i)
+                self.blocks[i].self_attn.set_memory(m)
+
+        else:
+            raise ValueError(
+                f"WanModelWithMemoryV5.forward: 未知 mem_source={src!r}"
+                "（合法值：'encoder' / 'ideal_A' / 'ideal_B'）。"
+            )
 
         out = super().forward(
             x, t, context, seq_len, y=y, dit_cond_dict=dit_cond_dict
         )
         return out
+
+    # ------------------------------------------------------------------
+    # S-V4（Step 43）：encoder-free ideal injection 的来源开关 + 档 B 编码
+    # ------------------------------------------------------------------
+
+    def set_mem_source(self, src: str) -> None:
+        """设置 memory token 来源（"encoder" / "ideal_A" / "ideal_B"）。
+
+        诊断用：S-V4 把"理想内容"灌进 in-context KV 槽时切到 ideal_A/ideal_B；
+        默认 "encoder" 保持现行为完全不变（向后兼容）。
+        """
+        if src not in ("encoder", "ideal_A", "ideal_B"):
+            raise ValueError(
+                f"set_mem_source: 未知 src={src!r}（合法：encoder/ideal_A/ideal_B）。")
+        self._mem_source = src
+
+    def set_layer_kv_cache(self, cache: Optional[dict]) -> None:
+        """设置档 A 的逐层真实 KV-cache：{layer_index: [1, L_mem, dim]} 或 None。
+
+        cache[i] 是「冻结骨干对记忆帧 forward 时第 i 个注入层 self_attn 的输入 hidden」，
+        注入时经该层冻结 self.k/self.v 投影成真·KV（与骨干对当前帧 token 的处理一致）。
+        """
+        self._layer_kv_cache = cache
+
+    def _encode_ideal_B(self, latents: Tensor) -> Tensor:
+        """档 B：零填充通道 → 冻结 patch_embedding → adaptive_pool → [1, K*gg, dim]。
+
+        把 memory_latents [K, z_dim, h, w] 的 z_dim(=16) 通道**零填充到骨干 patch_embedding
+        所需 in_dim 通道**（latent 放前 z_dim，cond/mask 槽置 0），过**冻结的**
+        self.patch_embedding（Conv3d，kernel/stride=(1,ph,pw)），再 adaptive_avg_pool 到
+        grid×grid，flatten 成 [K, gg, dim]，最后 reshape 成 [1, K*gg, dim]（复用现有逐层
+        共享注入管线）。这是「encoder 被设计去逼近」的分布内投影的理想版。
+
+        Args:
+            latents: [K, z_dim, h, w]（检索帧 VAE latent，z_dim 通常 16）。
+        Returns:
+            mem: [1, K*gg, dim]。
+        """
+        pe_w = self.patch_embedding.weight              # [dim, in_dim, 1, ph, pw]
+        in_dim = pe_w.shape[1]
+        K, z, h, w = latents.shape
+        latents = latents.to(dtype=pe_w.dtype, device=pe_w.device)
+        # 通道零填充 z_dim → in_dim（latent 放前 z，cond/mask 槽 0）；加时间维 T=1。
+        padded = latents.new_zeros(K, in_dim, 1, h, w)  # [K, in_dim, 1, h, w]
+        padded[:, :z, 0] = latents
+        feat = self.patch_embedding(padded)             # [K, dim, 1, h', w']
+        feat = feat.squeeze(2)                          # [K, dim, h', w']
+        pooled = F.adaptive_avg_pool2d(feat, (self._grid, self._grid))  # [K, dim, g, g]
+        gg = self._grid * self._grid
+        mem = pooled.reshape(K, self.dim, gg).transpose(1, 2)  # [K, gg, dim]
+        mem = mem.reshape(1, K * gg, self.dim)          # [1, K*gg, dim]
+        return mem
 
     # ------------------------------------------------------------------
     # 工厂方法：从预训练 WanModel 转换（R4 闸）
