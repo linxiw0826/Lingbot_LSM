@@ -1,0 +1,34 @@
+# v6 Accelerate 配置（蓝本：configs/v5/accelerate_v5.yaml）
+# DiT 冻结，只训 rank-128 LoRA（latent-concat frame-dim anchor 注入）
+# ZeRO-3：分片模型参数 + optimizer states + 梯度，6 GPU 均分 22.7B 参数
+# 每 GPU 模型参数从 45.5 GB → ~7.6 GB，释放约 38 GB 给 backward gradient checkpoint recompute
+# 项目记忆：训练必须 6 卡（0-5），4 卡会 OOM / 死锁 → num_processes 固定 6。
+
+compute_environment: LOCAL_MACHINE
+debug: false
+deepspeed_config:
+  zero_stage: 3
+  allgather_partitions: true
+  allgather_bucket_size: 2e8
+  overlap_comm: true
+  reduce_scatter: true
+  reduce_bucket_size: 2e8
+  contiguous_gradients: true
+  offload_optimizer_device: none
+  offload_param_device: none
+  zero3_init_flag: false
+  zero3_save_16bit_model: true
+distributed_type: DEEPSPEED
+downcast_bf16: 'no'
+enable_cpu_affinity: false
+machine_rank: 0
+main_training_function: main
+mixed_precision: bf16
+num_machines: 1
+num_processes: 6
+rdzv_backend: static
+same_network: true
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false
