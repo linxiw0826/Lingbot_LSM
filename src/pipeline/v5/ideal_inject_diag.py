@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import shutil
 import sys
 import tempfile
 from contextlib import contextmanager
@@ -46,6 +47,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 import torch
+from PIL import Image
 
 # ---------------------------------------------------------------------------
 # sys.path（与 eval_v5.py / train_v5.py 一致）
@@ -188,10 +190,17 @@ def _parse_args():
     p.add_argument("--tag", type=str, default="ideal_inject",
                    help="eval 场景 tag（INDEX 区分用，默认 ideal_inject）")
 
-    # ---- 定性渲染（本组件留接口，主跑定量）----
+    # ---- 定性渲染（S-V4 / Step 43 定性部分：完整多 clip 自回归长视频，off vs ideal_A）----
     p.add_argument("--render_qual", action="store_true", default=False,
-                   help="定性渲染开关（留接口：复用 infer_v5 对某 case 渲 ideal_A vs off 长视频）。"
-                        "本组件主跑定量，定性由 Orchestrator 在定量 GO 后单独跑。")
+                   help="定性渲染开关（向后兼容 additive）：开启时走【定性渲染路径】——对每个 "
+                        "revisit case 渲完整多 clip 自回归长视频（off vs ideal_A），不算 DINO / "
+                        "不判 GO/NO-GO；纯出视频供眼看。**不开时定量三臂行为逐位不变。** "
+                        "定量与定性可分别独立跑（同一脚本，靠本开关切路径）。")
+    p.add_argument("--num_clips_qual", type=int, default=5,
+                   help="定性长视频的 clip 数（默认 5；5 clips × frame_num=81 @ fps=16 ≈ 25s/405 帧）。"
+                        "帧数复用 --frame_num（默认 81）。")
+    p.add_argument("--qual_arms", type=str, default="off,ideal_A",
+                   help="定性渲染的臂子集（逗号分隔，默认 off,ideal_A；可加 random_A，省算力默认不含）。")
 
     # ---- 分片（additive：shard_count 默认 1 → 逐位与改前一致）----
     # 多卡并行诊断用：与 eval_v5 语义一致，但**切分轴是 revisit case**（非 episode），
@@ -660,18 +669,206 @@ def _verdict(all_records: List[Dict], arms: List[str], margin: float,
 
 
 # ===========================================================================
-# 定性渲染（留接口，主跑定量）
+# 定性渲染（S-V4 / Step 43 定性部分）：完整多 clip 自回归长视频，off vs ideal_A
+#
+#   每个 revisit case 渲一条 ~25s 长视频（默认 5 clips × frame_num=81 @ 16fps = 405 帧），
+#   自回归（上一 clip 末帧 → 下一 clip current_img），镜像 infer_v5 的多 clip 循环
+#   （seed=seed+clip_idx、sample_steps=num_inference_steps、sample_shift、guide_scale、size、
+#    prompt 同 diag 默认）。两臂并排眼看「回到旧地」的重访 clip（最后一个 clip）：
+#     · off     ：纯自回归无注入（mem_source=encoder + memory_latents=None → 各层 set_memory(None)）。
+#     · ideal_A ：对该 case 的 GT 首访帧（= 定量 ideal_A 同一帧）用 _capture_layer_kv 捕获一次
+#                 逐层真实 KV（固定低噪步，复用定量现成逻辑），贯穿全部 clip 注入。
+#   纯出视频，不算 DINO / 不判 GO/NO-GO。复用定量的模型加载 / _capture_layer_kv / _arm_injection /
+#   _decode_episode_video / _enumerate_cases / _save_video，不重造轮子。
 # ===========================================================================
 
-def _render_qualitative(args):
-    """定性渲染留接口：复用 infer_v5 的多 clip 生成对某 case 渲 ideal_A vs off 长视频。
+def _render_case_qual(wan_i2v, model, memory_layers, ep, ep_id, pt, frames,
+                      args, device, videos_root, qual_arms, num_clips):
+    """对单个 (episode, revisit case) 渲完整多 clip 自回归长视频（每臂一条 long_video.mp4）。
 
-    本组件主跑定量；定性渲染由 Orchestrator 在定量 GO 后单独跑（infer_v5 路径）。
-    这里只留接口与说明，不实现完整渲染，避免本组件膨胀 / 拖慢定量主跑。
+    产出：videos/<ep_id>/q<query_frame>/long_video_<arm>.mp4（405 帧 @ args.fps）。
+
+    长视频窗口锚定：使重访 query_frame 落在**最后一个 clip**——这样并排观看时，最后一个 clip
+    （局部帧 (num_clips-1)*frame_num : num_clips*frame_num，5×81 时即帧 324-404）正是模型「回到
+    旧地」的重访段，便于眼看 ideal_A 是否比 off 更忠实于 GT 首访场景。
     """
-    logger.warning(
-        "--render_qual 已开启，但定性渲染在本组件仅留接口（主跑定量）。"
-        "定量 GO 后请由 Orchestrator 用 infer_v5.py 对目标 case 单独渲 ideal_A vs off 长视频。")
+    from wan.configs import MAX_AREA_CONFIGS
+    max_area = MAX_AREA_CONFIGS[args.size]
+    T = ep.poses.shape[0]
+    frame_num = args.frame_num
+    total_frames = num_clips * frame_num
+
+    q_dir = os.path.join(videos_root, ep_id, f"q{pt.query_frame}")
+    os.makedirs(q_dir, exist_ok=True)
+
+    # 留 GT 首访帧 png 供并排对照（与定量 _process_case 同口径）
+    try:
+        _save_frame_png(frames[int(pt.first_visit_frame)],
+                        os.path.join(q_dir, "gt_first_visit.png"))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("定性 ep=%s q=%d：存 gt_first_visit.png 失败（非致命）: %s",
+                       ep_id, pt.query_frame, exc)
+
+    # ---- 锚定 5-clip 长视频窗口：使 query_frame 落在最后一个 clip ----
+    win_start = pt.query_frame - (num_clips - 1) * frame_num
+    win_start = int(max(0, min(win_start, max(0, T - total_frames))))
+    logger.info(
+        "定性 ep=%s q=%d：长视频窗口 win_start=%d，%d clips × %d 帧 = %d 帧（first_visit=%d）",
+        ep_id, pt.query_frame, win_start, num_clips, frame_num, total_frames,
+        pt.first_visit_frame,
+    )
+
+    # ---- ideal_A：对 GT 首访帧捕获一次逐层真实 KV（与定量 ideal_A 同一帧、同低噪步）----
+    cache_ideal = None
+    if "ideal_A" in qual_arms:
+        # 捕获前确保 model / vae 在 device（generate 的 offload 可能把它们搬到 CPU）
+        model.to(device)
+        wan_i2v.vae.model.to(device)
+        fi = int(pt.first_visit_frame)
+        if 0 <= fi < T:
+            cache_ideal = _capture_layer_kv(
+                wan_i2v, model, frames, ep, fi, args, device, memory_layers)
+        else:
+            logger.warning("定性 ep=%s q=%d：first_visit_frame=%d 越界 → 跳过 ideal_A 臂",
+                           ep_id, pt.query_frame, fi)
+
+    for arm in qual_arms:
+        if arm == "ideal_A" and cache_ideal is None:
+            continue
+        out_path = os.path.join(q_dir, f"long_video_{arm}.mp4")
+        if os.path.exists(out_path):
+            logger.info("定性 ep=%s q=%d [%s]：long_video 已存在 → 跳过", ep_id, pt.query_frame, arm)
+            continue
+
+        # 起始首帧 = 窗口首帧（自然画质 demo，不弱化；镜像 infer_v5 episode 模式 frames[0]）
+        current_img = _frame_to_pil(frames[win_start])
+        clip_videos: List[np.ndarray] = []
+
+        for clip_idx in range(num_clips):
+            clip_start = win_start + clip_idx * frame_num
+            clip_end = clip_start + frame_num
+            if clip_end <= T:
+                poses_c = ep.poses[clip_start:clip_end].astype(np.float32)
+                acts_c = ep.actions[clip_start:clip_end].astype(np.float32)
+                intr_c = ep.intrinsics[clip_start:clip_end].astype(np.float32)
+            else:
+                # 数据不足：取末尾 frame_num 帧 + 末帧 pad（对齐 infer_v5 / _frame_to_clip_slice fallback）
+                poses_c, acts_c, intr_c, _ = _frame_to_clip_slice(ep, clip_start, frame_num)
+                poses_c = poses_c.astype(np.float32)
+                acts_c = acts_c.astype(np.float32)
+                intr_c = intr_c.astype(np.float32)
+
+            tmp_dir = tempfile.mkdtemp(
+                prefix=f"v5_qual_{ep_id}_q{pt.query_frame}_{arm}_c{clip_idx}_")
+            np.save(os.path.join(tmp_dir, "poses.npy"), poses_c)
+            np.save(os.path.join(tmp_dir, "action.npy"), acts_c)
+            np.save(os.path.join(tmp_dir, "intrinsics.npy"), intr_c)
+
+            # 注入排期：ideal_A **贯穿全部 clip 注入**（"can't hurt, might help"——冻结骨干能忽略
+            # 无关记忆；非 OPEN 决策，无 PENDING 依赖）。如日后要改成「只在重访 clip 注入」，把下方
+            # _arm_injection 的 arm 在 clip_idx < num_clips-1 时传 "off" 即可（off 臂不注入）。
+            try:
+                with _arm_injection(wan_i2v, model, arm, cache_ideal, None, None,
+                                    inject_high=args.inject_high):
+                    video = wan_i2v.generate(
+                        args.prompt, current_img, action_path=tmp_dir, max_area=max_area,
+                        frame_num=frame_num, shift=args.sample_shift, sample_solver="unipc",
+                        sampling_steps=args.num_inference_steps, guide_scale=args.guide_scale,
+                        seed=args.seed + clip_idx, offload_model=True,
+                    )
+            finally:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
+            if video is None:
+                logger.warning("定性 ep=%s q=%d [%s] clip %d/%d：生成 None，终止该臂",
+                               ep_id, pt.query_frame, arm, clip_idx + 1, num_clips)
+                break
+            if isinstance(video, torch.Tensor):
+                video = video.detach().cpu().float().numpy()
+            video = np.asarray(video, dtype=np.float32)  # [3,F,H,W] in [-1,1]
+            clip_videos.append(video)
+
+            # 自回归链接：本 clip 末帧 → 下一 clip 首帧（镜像 infer_v5）
+            last_chw = video[:, -1]                                    # [3,H,W]
+            last_hwc = (last_chw.transpose(1, 2, 0) * 127.5 + 127.5
+                        ).clip(0, 255).astype(np.uint8)               # [H,W,3] uint8
+            current_img = Image.fromarray(last_hwc)
+            logger.info("定性 ep=%s q=%d [%s]：clip %d/%d done", ep_id, pt.query_frame,
+                        arm, clip_idx + 1, num_clips)
+
+        if not clip_videos:
+            logger.warning("定性 ep=%s q=%d [%s]：无 clip 生成，跳过保存",
+                           ep_id, pt.query_frame, arm)
+            continue
+        full_video = np.concatenate(clip_videos, axis=1)              # [3, total_F, H, W]
+        _save_video(full_video, out_path, fps=args.fps)
+        logger.info("定性 ep=%s q=%d [%s]：长视频已存 → %s（%d 帧 @ %dfps）",
+                    ep_id, pt.query_frame, arm, out_path, full_video.shape[1], args.fps)
+
+
+def _render_qualitative(wan_i2v, model, memory_layers, ep_groups, ep_ids, args,
+                        device, height, width, videos_root, min_time_gap_frames):
+    """定性渲染主驱动：枚举 revisit case（复用 _enumerate_cases）→ 分片 → 逐 case 渲长视频。
+
+    分片口径与定量完全一致（按 case 全局序号取模），让定性也能 6 卡并行；
+    shard_count<=1 时处理全部 case。每个 episode 只解码一次（_decode_episode_video，
+    定性不需要 VAE encode 全 episode，故不调 _decode_episode）。
+    """
+    _requested = [a.strip() for a in args.qual_arms.split(",") if a.strip()]
+    if "random_A" in _requested:
+        # 定性暂不渲 random_A：本路径未捕获错帧 KV-cache（省算力，task 默认关）；若直接放行会
+        # 用 None cache 注入 → 产出与 off 等价却标 random_A 的误导视频。故显式剔除并告警。
+        logger.warning("定性渲染暂不支持 random_A（未捕获错帧 KV-cache）→ 已从 qual_arms 剔除。")
+    qual_arms = [a for a in _requested if a in ("off", "ideal_A")]
+    if not qual_arms:
+        qual_arms = ["off", "ideal_A"]
+    # off 在前（off 臂依赖复位态为 encoder；ideal_A 的 _arm_injection finally 会复位 encoder）
+    _order = ("off", "ideal_A")
+    qual_arms = [a for a in _order if a in qual_arms]
+    num_clips = max(1, args.num_clips_qual)
+    logger.info("定性渲染：qual_arms=%s num_clips=%d frame_num=%d fps=%d",
+                qual_arms, num_clips, args.frame_num, args.fps)
+
+    ordered_cases, ep_cache = _enumerate_cases(ep_ids, ep_groups, args, min_time_gap_frames)
+    if not ordered_cases:
+        logger.error("定性渲染：无 revisit case，退出。")
+        return
+
+    if args.shard_count > 1:
+        sel = [(gi, e, p) for gi, (e, p) in enumerate(ordered_cases)
+               if gi % args.shard_count == args.shard_index]
+    else:
+        sel = [(gi, e, p) for gi, (e, p) in enumerate(ordered_cases)]
+    logger.info("定性渲染：case 全集 %d，本分片处理 %d（shard %d/%d，max_cases=%d 已在切分前应用）",
+                len(ordered_cases), len(sel), args.shard_index, args.shard_count, args.max_cases)
+    if not sel:
+        logger.error("定性渲染：shard %d/%d 分到 0 个 case，退出。",
+                     args.shard_index, args.shard_count)
+        return
+
+    from collections import OrderedDict
+    by_ep: "OrderedDict[str, List]" = OrderedDict()
+    for _gi, ep_id, pt in sel:
+        by_ep.setdefault(ep_id, []).append(pt)
+
+    for ep_id, pts in by_ep.items():
+        ep = ep_cache[ep_id]
+        logger.info("定性 Episode %s：T=%d，本分片 %d 个 case", ep_id, ep.poses.shape[0], len(pts))
+        try:
+            frames = _decode_episode_video(ep, height=height, width=width)  # [T,3,H,W]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("定性 episode %s 解码失败: %s；跳过", ep_id, exc)
+            continue
+        for pt in pts:
+            try:
+                _render_case_qual(wan_i2v, model, memory_layers, ep, ep_id, pt,
+                                  frames, args, device, videos_root, qual_arms, num_clips)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("定性 case 渲染失败 ep=%s q=%d: %s", ep_id, pt.query_frame, exc)
+                continue
+        del frames
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 # ===========================================================================
@@ -859,6 +1056,14 @@ def main():
     model = wan_i2v.low_noise_model  # WanModelWithMemoryV5（W2：只 low 转 V5）
     memory_layers = list(model._memory_layers)
 
+    # ---- 定性渲染路径（--render_qual）：只渲长视频，不算 DINO / 不判 GO/NO-GO，提前返回。----
+    #      不开 --render_qual 时此分支跳过，下方定量三臂行为逐位不变（向后兼容硬要求）。
+    if args.render_qual:
+        _render_qualitative(wan_i2v, model, memory_layers, ep_groups, ep_ids, args,
+                            device, height, width, videos_root, min_time_gap_frames)
+        logger.info("定性渲染完成。输出目录: %s", run_dir)
+        return
+
     all_records: List[Dict] = []
     run_dir_str = str(run_dir)
 
@@ -952,9 +1157,6 @@ def main():
         return
 
     _verdict(all_records, arms, args.go_margin, str(run_dir))
-
-    if args.render_qual:
-        _render_qualitative(args)
 
     logger.info("Done. 输出目录: %s", run_dir)
 
