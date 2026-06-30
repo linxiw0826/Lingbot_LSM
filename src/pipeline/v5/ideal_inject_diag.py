@@ -193,6 +193,21 @@ def _parse_args():
                    help="定性渲染开关（留接口：复用 infer_v5 对某 case 渲 ideal_A vs off 长视频）。"
                         "本组件主跑定量，定性由 Orchestrator 在定量 GO 后单独跑。")
 
+    # ---- 分片（additive：shard_count 默认 1 → 逐位与改前一致）----
+    # 多卡并行诊断用：与 eval_v5 语义一致，但**切分轴是 revisit case**（非 episode），
+    # 因为本诊断的全局上限是 --max_cases（case 数）而非 episode 数。先在所有 episode 上
+    # 跑 revisit case 检测得到**完整 case 列表**（按 episode 升序、episode 内 query 升序），
+    # 并**在分片切分之前**应用 --max_cases 全局上限，保证各分片看到同一全集；然后本分片
+    # 只处理 `case_global_index % shard_count == shard_index` 的 case。各分片用各自 GPU
+    # （脚本层 CUDA_VISIBLE_DEVICES 指定，代码内 --device 仍用 cuda:0），写各自 run_dir
+    # （脚本传不同 --tag），跑完用 merge_diag_shards.py 合并 per_window.csv + 重算判决。
+    # 单卡场景不传这两个参数即可（shard_count=1 → 走原始路径，逐位不变）。
+    p.add_argument("--shard_index", type=int, default=0,
+                   help="当前分片索引（0-based），多卡并行诊断用。默认 0。")
+    p.add_argument("--shard_count", type=int, default=1,
+                   help="总分片数。默认 1=不分片（走原始路径，逐位与单进程一致）；"
+                        ">1 时按 case 全局序号取模 [case_idx %% shard_count == shard_index] 分片。")
+
     return p.parse_args()
 
 
@@ -660,6 +675,131 @@ def _render_qualitative(args):
 
 
 # ===========================================================================
+# episode 解码 + 单 case 处理（从 main 抽出，供单卡 / 分片两条路径共用）
+# ===========================================================================
+
+def _decode_episode(wan_i2v, ep, args, height, width, device):
+    """解码 episode video + VAE encode → (frames[T,3,H,W], latents_per_frame[T,z,h,w])。
+
+    与原 main 内联逻辑逐字一致；抽成函数供单卡 / 分片路径共用（行为不变）。
+    """
+    T = ep.poses.shape[0]
+    frames = _decode_episode_video(ep, height=height, width=width)  # [T,3,H,W]
+    latents_full = _vae_encode_batched(wan_i2v.vae, frames, device=device, batch_frames=8)
+    latents_per_frame = _expand_latents_to_frames(latents_full, T)  # [T,z,h,w]
+    del latents_full
+    return frames, latents_per_frame
+
+
+def _process_case(wan_i2v, model, memory_layers, ep, ep_id, pt, frames,
+                  latents_per_frame, args, device, rng, videos_root, run_dir,
+                  all_records, arms, need_ideal):
+    """处理单个 (episode, revisit case)：档 A 捕获 + 逐臂生成 + 打分落盘。
+
+    与原 main 内层 `for pt in points` 的 try 块体逐字一致（抽出以供单卡 / 分片共用），
+    成功则向 all_records 追加各臂记录；异常由调用方捕获（保留原 case 级 try/except 语义）。
+    """
+    T = ep.poses.shape[0]
+    q_dir = os.path.join(videos_root, ep_id, f"q{pt.query_frame}")
+    os.makedirs(q_dir, exist_ok=True)
+    gt_first = frames[pt.first_visit_frame]  # [3,H,W]
+    gt_png_path = os.path.join(q_dir, "gt_first_visit.png")
+    _save_frame_png(gt_first, gt_png_path)
+
+    _pc, _ac, _ic, seg_start = _frame_to_clip_slice(ep, pt.query_frame, args.frame_num)
+    base_img = _frame_to_pil(frames[seg_start])
+
+    # ---- 档 A 捕获（ideal/random 各一份逐层 KV-cache）----
+    cache_ideal = cache_random = None
+    oracle_latent = None
+    if need_ideal:
+        # 捕获前确保 low_noise_model / vae 在 device（generate 的 offload 可能搬走）
+        model.to(device)
+        wan_i2v.vae.model.to(device)
+        fi = int(pt.first_visit_frame)
+        if 0 <= fi < T and "ideal_A" in arms:
+            cache_ideal = _capture_layer_kv(
+                wan_i2v, model, frames, ep, fi, args, device, memory_layers)
+        if "random_A" in arms:
+            rfi = _pick_random_hist_frame(pt, T, rng)
+            if rfi is not None:
+                cache_random = _capture_layer_kv(
+                    wan_i2v, model, frames, ep, int(rfi), args, device, memory_layers)
+            else:
+                logger.warning("ep=%s q=%d：random_A 取不到错帧 → 跳过该臂",
+                               ep_id, pt.query_frame)
+    if "ideal_B" in arms:
+        fi = int(pt.first_visit_frame)
+        if 0 <= fi < T:
+            oracle_latent = latents_per_frame[fi].unsqueeze(0).contiguous()  # [1,z,h,w]
+
+    # ---- 逐臂生成 + 打分 ----
+    for arm in arms:
+        if arm == "ideal_A" and cache_ideal is None:
+            continue
+        if arm == "random_A" and cache_random is None:
+            continue
+        if arm == "ideal_B" and oracle_latent is None:
+            continue
+        mp4_path = os.path.join(q_dir, f"{arm}.mp4")
+        if os.path.exists(mp4_path):
+            video = _read_video_back(mp4_path)
+            if video is not None:
+                logger.info("ep=%s q=%d [%s]：mp4 已存在 → 读回重算指标",
+                            ep_id, pt.query_frame, arm)
+                _score_and_record(all_records, run_dir, args, ep_id, pt, arm,
+                                  video, gt_first, mp4_path, gt_png_path, device)
+                continue
+        _tmp = tempfile.mkdtemp(prefix=f"v5_ideal_{ep_id}_q{pt.query_frame}_{arm}_")
+        try:
+            video = _generate_arm(
+                wan_i2v, model, arm, cache_ideal, cache_random, oracle_latent,
+                pt, ep, base_img, args, device, rng, _tmp)
+        finally:
+            import shutil
+            shutil.rmtree(_tmp, ignore_errors=True)
+        if video is None:
+            logger.warning("ep=%s q=%d [%s]：生成 None，跳过", ep_id, pt.query_frame, arm)
+            continue
+        _save_video(video, mp4_path, fps=args.fps)
+        _score_and_record(all_records, run_dir, args, ep_id, pt, arm,
+                          video, gt_first, mp4_path, gt_png_path, device)
+
+
+def _enumerate_cases(ep_ids, ep_groups, args, min_time_gap_frames):
+    """分片用：枚举**完整** revisit case 列表（不解码视频、不消耗 rng）。
+
+    顺序与单卡路径完全一致：episode 按 ep_ids 顺序、episode 内 query 升序
+    （_find_revisit_points 已按 query_frame 升序）。**在分片切分之前**应用 --max_cases
+    全局上限，保证各分片看到同一全集再切。
+
+    Returns:
+        (ordered_cases, ep_cache)
+        ordered_cases: List[(ep_id, RevisitPoint)]，按全局处理序，已截断到 max_cases。
+        ep_cache:      {ep_id: EpisodeData}，避免处理阶段重复 build。
+    """
+    ordered_cases: List = []
+    ep_cache: Dict = {}
+    for ep_id in ep_ids:
+        if args.max_cases > 0 and len(ordered_cases) >= args.max_cases:
+            break
+        ep = build_episode_data(ep_id, ep_groups[ep_id],
+                                clip_overlap_frames=args.clip_overlap_frames)
+        if ep is None:
+            continue
+        points = _find_revisit_points(ep, args, min_time_gap_frames)
+        if not points:
+            logger.warning("Episode %s 无重访点；跳过", ep_id)
+            continue
+        ep_cache[ep_id] = ep
+        for pt in points:
+            if args.max_cases > 0 and len(ordered_cases) >= args.max_cases:
+                break
+            ordered_cases.append((ep_id, pt))
+    return ordered_cases, ep_cache
+
+
+# ===========================================================================
 # 主入口
 # ===========================================================================
 
@@ -720,108 +860,92 @@ def main():
     memory_layers = list(model._memory_layers)
 
     all_records: List[Dict] = []
-    n_cases = 0
+    run_dir_str = str(run_dir)
 
-    for ep_id in ep_ids:
-        if n_cases >= args.max_cases > 0:
-            break
-        ep = build_episode_data(ep_id, ep_groups[ep_id],
-                                clip_overlap_frames=args.clip_overlap_frames)
-        if ep is None:
-            continue
-        T = ep.poses.shape[0]
-        points = _find_revisit_points(ep, args, min_time_gap_frames)
-        if not points:
-            logger.warning("Episode %s 无重访点；跳过", ep_id)
-            continue
-        logger.info("Episode %s: T=%d, 重访点 %d 个", ep_id, T, len(points))
-
-        try:
-            frames = _decode_episode_video(ep, height=height, width=width)  # [T,3,H,W]
-            latents_full = _vae_encode_batched(wan_i2v.vae, frames, device=device, batch_frames=8)
-            latents_per_frame = _expand_latents_to_frames(latents_full, T)  # [T,z,h,w]
-            del latents_full
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Episode %s 解码/encode 失败: %s；跳过", ep_id, exc)
-            continue
-
-        for pt in points:
+    if args.shard_count <= 1:
+        # ---- 单卡原始路径（shard_count<=1 → 逐位与改前一致）----
+        n_cases = 0
+        for ep_id in ep_ids:
             if n_cases >= args.max_cases > 0:
                 break
+            ep = build_episode_data(ep_id, ep_groups[ep_id],
+                                    clip_overlap_frames=args.clip_overlap_frames)
+            if ep is None:
+                continue
+            T = ep.poses.shape[0]
+            points = _find_revisit_points(ep, args, min_time_gap_frames)
+            if not points:
+                logger.warning("Episode %s 无重访点；跳过", ep_id)
+                continue
+            logger.info("Episode %s: T=%d, 重访点 %d 个", ep_id, T, len(points))
+
             try:
-                q_dir = os.path.join(videos_root, ep_id, f"q{pt.query_frame}")
-                os.makedirs(q_dir, exist_ok=True)
-                gt_first = frames[pt.first_visit_frame]  # [3,H,W]
-                gt_png_path = os.path.join(q_dir, "gt_first_visit.png")
-                _save_frame_png(gt_first, gt_png_path)
-
-                _pc, _ac, _ic, seg_start = _frame_to_clip_slice(ep, pt.query_frame, args.frame_num)
-                base_img = _frame_to_pil(frames[seg_start])
-
-                # ---- 档 A 捕获（ideal/random 各一份逐层 KV-cache）----
-                cache_ideal = cache_random = None
-                oracle_latent = None
-                if need_ideal:
-                    # 捕获前确保 low_noise_model / vae 在 device（generate 的 offload 可能搬走）
-                    model.to(device)
-                    wan_i2v.vae.model.to(device)
-                    fi = int(pt.first_visit_frame)
-                    if 0 <= fi < T and "ideal_A" in arms:
-                        cache_ideal = _capture_layer_kv(
-                            wan_i2v, model, frames, ep, fi, args, device, memory_layers)
-                    if "random_A" in arms:
-                        rfi = _pick_random_hist_frame(pt, T, rng)
-                        if rfi is not None:
-                            cache_random = _capture_layer_kv(
-                                wan_i2v, model, frames, ep, int(rfi), args, device, memory_layers)
-                        else:
-                            logger.warning("ep=%s q=%d：random_A 取不到错帧 → 跳过该臂",
-                                           ep_id, pt.query_frame)
-                if "ideal_B" in arms:
-                    fi = int(pt.first_visit_frame)
-                    if 0 <= fi < T:
-                        oracle_latent = latents_per_frame[fi].unsqueeze(0).contiguous()  # [1,z,h,w]
-
-                # ---- 逐臂生成 + 打分 ----
-                for arm in arms:
-                    if arm == "ideal_A" and cache_ideal is None:
-                        continue
-                    if arm == "random_A" and cache_random is None:
-                        continue
-                    if arm == "ideal_B" and oracle_latent is None:
-                        continue
-                    mp4_path = os.path.join(q_dir, f"{arm}.mp4")
-                    if os.path.exists(mp4_path):
-                        video = _read_video_back(mp4_path)
-                        if video is not None:
-                            logger.info("ep=%s q=%d [%s]：mp4 已存在 → 读回重算指标",
-                                        ep_id, pt.query_frame, arm)
-                            _score_and_record(all_records, str(run_dir), args, ep_id, pt, arm,
-                                              video, gt_first, mp4_path, gt_png_path, device)
-                            continue
-                    _tmp = tempfile.mkdtemp(prefix=f"v5_ideal_{ep_id}_q{pt.query_frame}_{arm}_")
-                    try:
-                        video = _generate_arm(
-                            wan_i2v, model, arm, cache_ideal, cache_random, oracle_latent,
-                            pt, ep, base_img, args, device, rng, _tmp)
-                    finally:
-                        import shutil
-                        shutil.rmtree(_tmp, ignore_errors=True)
-                    if video is None:
-                        logger.warning("ep=%s q=%d [%s]：生成 None，跳过", ep_id, pt.query_frame, arm)
-                        continue
-                    _save_video(video, mp4_path, fps=args.fps)
-                    _score_and_record(all_records, str(run_dir), args, ep_id, pt, arm,
-                                      video, gt_first, mp4_path, gt_png_path, device)
-
-                n_cases += 1
+                frames, latents_per_frame = _decode_episode(
+                    wan_i2v, ep, args, height, width, device)
             except Exception as exc:  # noqa: BLE001
-                logger.exception("case 处理失败 ep=%s q=%d: %s", ep_id, pt.query_frame, exc)
+                logger.warning("Episode %s 解码/encode 失败: %s；跳过", ep_id, exc)
                 continue
 
-        del frames, latents_per_frame
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            for pt in points:
+                if n_cases >= args.max_cases > 0:
+                    break
+                try:
+                    _process_case(wan_i2v, model, memory_layers, ep, ep_id, pt, frames,
+                                  latents_per_frame, args, device, rng, videos_root,
+                                  run_dir_str, all_records, arms, need_ideal)
+                    n_cases += 1
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("case 处理失败 ep=%s q=%d: %s", ep_id, pt.query_frame, exc)
+                    continue
+
+            del frames, latents_per_frame
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+    else:
+        # ---- 分片路径：先枚举完整 case 全集（max_cases 在切分前应用），再按 case 全局序号取模 ----
+        ordered_cases, ep_cache = _enumerate_cases(
+            ep_ids, ep_groups, args, min_time_gap_frames)
+        logger.info("分片 %d/%d：case 全集 %d 个（max_cases=%d 已在切分前应用）",
+                    args.shard_index, args.shard_count, len(ordered_cases), args.max_cases)
+        shard_cases = [(gi, ep_id, pt) for gi, (ep_id, pt) in enumerate(ordered_cases)
+                       if gi % args.shard_count == args.shard_index]
+        logger.info("分片 %d/%d：本分片处理 %d 个 case（全局序号 %% %d == %d）",
+                    args.shard_index, args.shard_count, len(shard_cases),
+                    args.shard_count, args.shard_index)
+        if not shard_cases:
+            logger.error("shard %d/%d 分到 0 个 case（全集太小？），退出。",
+                         args.shard_index, args.shard_count)
+            return
+
+        # 按 episode 分组（保持全局序）→ 每个 episode 只解码一次
+        from collections import OrderedDict
+        by_ep: "OrderedDict[str, List]" = OrderedDict()
+        for _gi, ep_id, pt in shard_cases:
+            by_ep.setdefault(ep_id, []).append(pt)
+
+        for ep_id, pts in by_ep.items():
+            ep = ep_cache[ep_id]
+            T = ep.poses.shape[0]
+            logger.info("Episode %s: T=%d, 本分片 %d 个 case", ep_id, T, len(pts))
+            try:
+                frames, latents_per_frame = _decode_episode(
+                    wan_i2v, ep, args, height, width, device)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Episode %s 解码/encode 失败: %s；跳过", ep_id, exc)
+                continue
+
+            for pt in pts:
+                try:
+                    _process_case(wan_i2v, model, memory_layers, ep, ep_id, pt, frames,
+                                  latents_per_frame, args, device, rng, videos_root,
+                                  run_dir_str, all_records, arms, need_ideal)
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("case 处理失败 ep=%s q=%d: %s", ep_id, pt.query_frame, exc)
+                    continue
+
+            del frames, latents_per_frame
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     if not all_records:
         logger.error("无任何记录（无 case / 全失败），退出。")
