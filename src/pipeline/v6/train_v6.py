@@ -665,6 +665,199 @@ def save_lora(accelerator, model, run_dir, tag: str,
 
 
 # ============================================================
+# 训练健康诊断可复用测量（PROBE A 核心 + LoRA 范数）
+# ============================================================
+
+def _measure_anchor_onoff_diff(
+    trainer: LingBotTrainerV6,
+    model: nn.Module,
+    ctx: dict,
+    anchor_latent: torch.Tensor,
+    anchor_poses_np: np.ndarray,
+) -> float:
+    """PROBE A 核心（可复用）：同一 ctx（query_noise 已固定 → 两臂逐元素一致）跑
+    anchor frame-dim concat（ON）vs 无 anchor（OFF），返回 query 帧输出的 max abs diff。
+
+    **旁路 no_grad 测量**：只读输出、不建反传图、不进 loss/优化器 → 不污染梯度、
+    不改训练数值行为。run_r6_probes_v6 的 PROBE A 与每-epoch 诊断共用此函数（不重写）。
+    """
+    with torch.no_grad():
+        pred_on, _, lat_f_query, _ = _forward_with_optional_anchor(
+            trainer, model, ctx, anchor_latent, anchor_poses_np)
+        pred_off, _, _, _ = _forward_with_optional_anchor(
+            trainer, model, ctx, None, None)
+    return (pred_on[:, :lat_f_query].float() - pred_off.float()).abs().max().item()
+
+
+def _measure_lora_norms(model: nn.Module, accelerator) -> Dict[str, float]:
+    """聚合所有 LoRA 层的 ‖A‖ / ‖B‖ 总范数（旁路测量，只读权重不改任何状态）。
+
+    B 零初始化 → ‖B‖ 长期≈0 表示 LoRA 没学到东西（等价没训）；‖A‖ 反映 A 的漂移。
+
+    **ZeRO-3 正确聚合**：分片模式下 p.data 只是本 rank 的分片（partition），直接算范数会得到
+    size-0 的假 0 / 偏小值。故用 `deepspeed.zero.GatheredParameters` 在 with 块内把各 LoRA
+    参数聚合成完整张量后再算范数（与 save_lora 同一思路）。GatheredParameters 是集合通信 →
+    必须由**所有 rank**进入（本函数在所有 rank 上被调用）。非 ZeRO-3 / 无 deepspeed 时参数本就
+    完整，直接算。范数按参数平方和的平方根聚合（等价把所有 LoRA A/B 拼成一个向量取 L2 范数）。
+    """
+    unwrapped = accelerator.unwrap_model(model)
+    lora_named = [(n, p) for n, p in unwrapped.named_parameters()
+                  if p.requires_grad and ".lora_" in n]
+    a_named = [(n, p) for n, p in lora_named if ".lora_A." in n]
+    b_named = [(n, p) for n, p in lora_named if ".lora_B." in n]
+
+    def _agg_norm(named):
+        total_sq = 0.0
+        for _, p in named:
+            d = p.data
+            if d is None or d.numel() == 0:
+                continue
+            total_sq += float(d.detach().float().norm().item()) ** 2
+        return total_sq ** 0.5
+
+    try:
+        import deepspeed
+        with deepspeed.zero.GatheredParameters([p for _, p in lora_named], modifier_rank=0):
+            a_norm = _agg_norm(a_named)
+            b_norm = _agg_norm(b_named)
+    except (ImportError, AttributeError):
+        a_norm = _agg_norm(a_named)
+        b_norm = _agg_norm(b_named)
+
+    return {"diag/lora_A_norm": float(a_norm), "diag/lora_B_norm": float(b_norm)}
+
+
+def run_epoch_diagnostics(
+    trainer: LingBotTrainerV6,
+    model: nn.Module,
+    diag_batch: List[dict],
+    args,
+    accelerator,
+    wb_logger,
+    epoch: int,
+    global_step: int,
+    last_grad_norm: float,
+) -> None:
+    """每-epoch（或每 N epoch）训练健康诊断，防止「跑完才发现白训」。
+
+    记录（logger.info + W&B，仅主进程 log）：
+      - diag/lora_A_norm, diag/lora_B_norm：LoRA 权重范数增长（B 从 0 长出 = 真在学）
+      - diag/anchor_onoff_diff：复用 PROBE A，看注入是否**持续**有效（不退化成 no-op）
+      - diag/grad_norm：最近一次同步步的梯度范数趋势（_last_grad_norm）
+
+    **不改训练数值行为**：anchor ON/OFF 用 no_grad 旁路测量（不建图、不进 loss/优化器）；
+    LoRA 范数只读权重。测量前后临时 eval() → 恢复原 train/eval 状态。
+
+    **WARN1（防分布式集合通信不对齐 hang）**：整个诊断主体（_measure_lora_norms +
+    anchor ON/OFF forward）用统一 try/except 只 warn 包裹，任何失败都不中断训练、不 re-raise。
+    集合通信段（GatheredParameters / ZeRO-3 forward）严格「全 rank 一起做、要么全 rank 一起跳」：
+      - _measure_lora_norms 的 GatheredParameters 只遍历 named_parameters（各 rank 结构一致、
+        不因单 rank 数据异常而只在部分 rank 抛）→ 全 rank 直接进。
+      - anchor 集合 forward 前的准备（_select_anchor random / _build_target_ctx）是**非集合**且
+        可能因数据在部分 rank 失败 → 各 rank 先本地 try 准备，再用 dist.all_reduce(MIN) 广播
+        prep_ok；任一 rank 准备失败即全 rank 一致跳过后续集合 forward，绝不只部分 rank 进。
+
+    **WARN2（防诊断消耗全局 RNG 扰动主训练随机序列）**：进入时快照 torch(CPU)+cuda(all
+    devices)+python random(+numpy) 的全局 RNG，finally 里恢复 → 诊断的 _select_anchor(random)/
+    sample_timestep/torch.randn 推进的 RNG 不影响后续 epoch，diag-on/off 训练轨迹 bitwise 一致。
+    """
+    was_training = model.training
+    model.eval()
+
+    # ---- WARN2: 快照全局 RNG（进入即存，finally 恢复；get_* 均只读、不推进 RNG）----
+    _cpu_rng_state = torch.get_rng_state()
+    _cuda_rng_states = (
+        torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    )
+    _py_rng_state = random.getstate()
+    _np_rng_state = np.random.get_state()
+
+    def _all_rank_agree(local_ok: bool) -> bool:
+        """全 rank 一致的 ok 标志：dist.all_reduce(MIN) → 任一 rank 失败则全 rank 返回 False，
+        保证后续集合 op「全 rank 一起进 / 全 rank 一起跳」（防 ZeRO-3 集合通信不对齐 hang）。
+        单进程或 dist 未初始化时直接返回本地标志（无集合可对齐）。"""
+        if accelerator.num_processes <= 1 or not (
+            dist.is_available() and dist.is_initialized()
+        ):
+            return local_ok
+        flag = torch.tensor(
+            [1 if local_ok else 0], device=trainer.device, dtype=torch.int32
+        )
+        dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+        return bool(flag.item() > 0)
+
+    diff = None
+    try:
+        metrics: Dict[str, float] = {}
+
+        # 1. LoRA 权重范数（GatheredParameters 集合通信；结构对称 → 全 rank 一起进）
+        metrics.update(_measure_lora_norms(model, accelerator))
+
+        # 2. anchor ON/OFF diff（复用 PROBE A 核心；ZeRO-3 集合 forward，须全 rank 对称进入）
+        #    准备段（非集合、可能因数据在部分 rank 失败）先本地 try，再全 rank 对齐 prep_ok。
+        unwrapped = accelerator.unwrap_model(model)
+        anchor_latent = None
+        anchor_poses_np = None
+        ctx = None
+        prep_ok = True
+        try:
+            n_ctx = max(1, len(diag_batch) - 1)
+            context_clips = diag_batch[:n_ctx]
+            target_clip = diag_batch[n_ctx]
+            anchor_latent, anchor_poses_np = _select_anchor(
+                trainer, context_clips, args, trainer.device)
+            if anchor_latent is not None:
+                ctx = _build_target_ctx(trainer, unwrapped, target_clip)
+            else:
+                prep_ok = False  # 无 anchor → 无集合 forward 可跑（diag_batch 全 rank 相同）
+        except Exception as _prep_e:  # 非集合准备失败：本地记标志，随后全 rank 一致跳过集合段
+            prep_ok = False
+            logging.warning(
+                "epoch diag: anchor 准备失败（非致命，全 rank 一致跳过集合 forward）：%s",
+                _prep_e,
+            )
+
+        # 全 rank 对齐：任一 rank 准备失败 → 全 rank 一起跳过集合 forward（绝不只部分 rank 进）
+        if _all_rank_agree(prep_ok):
+            diff = _measure_anchor_onoff_diff(
+                trainer, unwrapped, ctx, anchor_latent, anchor_poses_np)
+            metrics["diag/anchor_onoff_diff"] = float(diff)
+
+        # 3. grad_norm 趋势（每步已入 W&B 的 train/grad_norm；此处再落 epoch 粒度 diag/grad_norm）
+        metrics["diag/grad_norm"] = float(last_grad_norm)
+
+        if accelerator.is_main_process:
+            logging.info(
+                "[DIAG] epoch %d | lora_A_norm=%.4e | lora_B_norm=%.4e | "
+                "anchor_onoff_diff=%s | grad_norm=%.3e",
+                epoch + 1,
+                metrics.get("diag/lora_A_norm", float("nan")),
+                metrics.get("diag/lora_B_norm", float("nan")),
+                ("%.3e" % diff) if diff is not None else "n/a",
+                metrics["diag/grad_norm"],
+            )
+            if wb_logger is not None and getattr(wb_logger, "enabled", False):
+                try:
+                    import wandb
+                    wandb.log(metrics, step=global_step)
+                except Exception as _we:
+                    logging.warning("epoch diag W&B log failed (non-fatal): %s", _we)
+    except Exception as _diag_e:  # WARN1: 诊断整体非致命，只 warn，绝不中断训练、绝不 re-raise
+        logging.warning("epoch diag 整体失败（非致命，训练继续）：%s", _diag_e)
+    finally:
+        if was_training:
+            model.train()
+        # ---- WARN2: 恢复全局 RNG（CPU + CUDA all devices + python random + numpy）----
+        torch.set_rng_state(_cpu_rng_state)
+        if _cuda_rng_states is not None:
+            torch.cuda.set_rng_state_all(_cuda_rng_states)
+        random.setstate(_py_rng_state)
+        np.random.set_state(_np_rng_state)
+    if accelerator.num_processes > 1:
+        accelerator.wait_for_everyone()
+
+
+# ============================================================
 # R6 探针（开训前强制，过不了 raise）
 # ============================================================
 
@@ -704,13 +897,9 @@ def run_r6_probes_v6(
 
     ctx = _build_target_ctx(trainer, unwrapped, target_clip)
 
-    # ---- 探针 A：ON vs OFF（query 帧逐元素比较；query_noise 由 ctx 固定，两臂一致）----
-    with torch.no_grad():
-        pred_on, _, lat_f_query, _ = _forward_with_optional_anchor(
-            trainer, unwrapped, ctx, anchor_latent, anchor_poses_np)
-        pred_off, _, _, _ = _forward_with_optional_anchor(
-            trainer, unwrapped, ctx, None, None)
-    diff = (pred_on[:, :lat_f_query].float() - pred_off.float()).abs().max().item()
+    # ---- 探针 A：ON vs OFF（复用 _measure_anchor_onoff_diff；query_noise 由 ctx 固定，两臂一致）----
+    diff = _measure_anchor_onoff_diff(
+        trainer, unwrapped, ctx, anchor_latent, anchor_poses_np)
     logging.info("R6 PROBE A (ON/OFF): max_abs_diff=%.3e (threshold=%.3e)",
                  diff, args.probe_onoff_thresh)
     if diff <= args.probe_onoff_thresh:
@@ -870,6 +1059,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--probe_onoff_thresh", type=float, default=1e-3,
                         help="R6 探针 A：ON/OFF 输出 max_abs_diff 下限阈值")
 
+    # ---- 训练全程健康诊断 ----
+    parser.add_argument("--diag_every_epochs", type=int, default=1,
+                        help="每 N 个 epoch 末尾跑一次训练健康诊断（LoRA ‖A‖/‖B‖ 范数 + "
+                             "anchor ON/OFF diff + grad_norm 趋势）；0=关闭周期诊断（只保留开训 "
+                             "R6 探针）。诊断为 no_grad 旁路测量，不改训练数值行为。")
+
     # ---- W&B ----
     parser.add_argument("--wandb_project", type=str, default="lingbot-memory")
     parser.add_argument("--wandb_entity", type=str, default=None)
@@ -1018,9 +1213,10 @@ def main():
                          start_epoch, start_global_step)
 
     # ---- R6 探针（训练循环之前，过不了 raise 退出）----
-    _probe_batch = next(iter(dataloader))
-    run_r6_probes_v6(trainer, model, _probe_batch, args, accelerator)
-    del _probe_batch
+    # 同一 batch 留作每-epoch 诊断的固定探针 batch（--diag_every_epochs），使 anchor ON/OFF
+    # diff 跨 epoch 可比（固定输入看注入是否随训练退化成 no-op），不额外占数据。
+    _diag_batch = next(iter(dataloader))
+    run_r6_probes_v6(trainer, model, _diag_batch, args, accelerator)
     gc.collect()
     torch.cuda.empty_cache()
 
@@ -1162,6 +1358,21 @@ def main():
                     "Epoch %d/%d | avg_loss=%.4f | lr=%.2e",
                     epoch + 1, args.num_epochs, avg_loss,
                     lr_scheduler.get_last_lr()[0],
+                )
+                if wb_logger is not None and getattr(wb_logger, "enabled", False):
+                    try:
+                        import wandb
+                        wandb.log({"diag/avg_loss": avg_loss, "diag/epoch": epoch + 1},
+                                  step=global_step)
+                    except Exception as _we:
+                        logging.warning("epoch avg_loss W&B log failed (non-fatal): %s", _we)
+
+            # ---- 每-epoch 训练健康诊断（旁路 no_grad，不改训练数值行为）----
+            if args.diag_every_epochs > 0 and (epoch + 1) % args.diag_every_epochs == 0:
+                run_epoch_diagnostics(
+                    trainer, model, _diag_batch, args, accelerator, wb_logger,
+                    epoch=epoch, global_step=global_step,
+                    last_grad_norm=_last_grad_norm,
                 )
 
             if (epoch + 1) % args.save_every_n_epochs == 0:

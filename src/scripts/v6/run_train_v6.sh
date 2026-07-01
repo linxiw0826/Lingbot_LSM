@@ -48,6 +48,7 @@ NUM_FRAMES=81
 HEIGHT=480
 WIDTH=832
 MAX_CONTEXT_CLIPS="${MAX_CONTEXT_CLIPS:-6}"
+DIAG_EVERY_EPOCHS="${DIAG_EVERY_EPOCHS:-1}"   # 每 N epoch 跑训练健康诊断（LoRA 范数+ON/OFF diff+grad_norm）；0=关
 
 # ---- run 名 / 续训钩子 ----
 RUN_NAME="${RUN_NAME:-}"                 # 空 → train_v6 用 default_run_name('latentconcat_lora')
@@ -116,6 +117,7 @@ TRAIN_ARGS=(
     --height                      "${HEIGHT}"
     --width                       "${WIDTH}"
     --max_context_clips           "${MAX_CONTEXT_CLIPS}"
+    --diag_every_epochs           "${DIAG_EVERY_EPOCHS}"
 )
 
 # run_name 留空 → 交给 train_v6 用 default_run_name；非空才透传
