@@ -69,6 +69,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 
 # ---------------------------------------------------------------------------
@@ -99,6 +100,7 @@ from pipeline.eval.oracle_injection import (  # noqa: E402
     RevisitPoint,
     _frame_to_clip_slice,
     _revisit_consistency,
+    _dino_feat,
     _frame_to_pil,
     _save_frame_png,
     _save_video,
@@ -176,7 +178,24 @@ def _parse_args():
     p.add_argument("--max_episodes", type=int, default=0,
                    help="0=不限；>0 时取前 N 个 episode")
     p.add_argument("--max_cases", type=int, default=5,
-                   help="总 revisit case 上限（默认 5，对齐 Step 44；在切分前应用）")
+                   help="总 revisit case 上限（默认 5，对齐 Step 44；**在天花板过滤之后、切分之前**应用）")
+
+    # ---- GT 天花板过滤（真重访筛选；丢弃几何匹配到的假重访）----
+    # 动态 CS:GO 下 compute_gt_revisit 靠绝对位置+yaw 匹配，会挑出「同位姿但画面全变」的假重访
+    # （DINO(首访,重访) ≤ DINO(首访,随机)）。这些假重访会污染闸门判读，故在跑生成**之前**用
+    # GT 帧 DINO 天花板把它们过滤掉（零生成、只 DINO + 已解码帧、不加载骨干）。判据复用
+    # revisit_metric_sanity 的 GT 天花板算法：d_vr=DINO(GT[首访],GT[重访])，
+    # d_vrand=DINO(GT[首访],随机帧)。保留 ⇔ d_vr - d_vrand >= min_ceiling_delta **且**
+    # d_vr >= min_ceiling_abs。
+    p.add_argument("--ceiling_filter", dest="ceiling_filter", action="store_true", default=True,
+                   help="开启 GT 天花板过滤（**默认 on**）：跑生成前丢弃假重访 case。")
+    p.add_argument("--no_ceiling_filter", dest="ceiling_filter", action="store_false",
+                   help="关闭 GT 天花板过滤，跑全部（几何匹配到的）case（向后兼容 / 对照用；"
+                        "此时行为与加过滤前逐位一致）。")
+    p.add_argument("--min_ceiling_delta", type=float, default=0.1,
+                   help="保留判据 Δ：d_vr - d_vrand 须 >= 此值（默认 0.1）。")
+    p.add_argument("--min_ceiling_abs", type=float, default=0.5,
+                   help="保留判据绝对下限：d_vr 须 >= 此值（默认 0.5，防 d_vr/d_vrand 都低）。")
 
     # ---- 臂 / 判据 ----
     p.add_argument("--arms", type=str, default=",".join(DEFAULT_ARMS),
@@ -431,6 +450,140 @@ def args_retrieval_is_bank() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# GT 天花板过滤（真重访筛选；零生成、只 DINO + 已解码 GT 帧、不加载骨干）
+#
+#   复用 revisit_metric_sanity 的 GT 天花板算法（`_dino_cosine` = 两帧各 `_dino_feat` 取余弦；
+#   DINO(首访,重访) vs DINO(首访,随机)），在跑生成**之前**丢弃几何匹配到的假重访 case
+#   （同位姿但画面全变：d_vr ≤ d_vrand）。这些假重访会污染 v6 闸门判读。
+# ---------------------------------------------------------------------------
+
+def _dino_cosine(frame_a: np.ndarray, frame_b: np.ndarray,
+                 device: torch.device) -> Optional[float]:
+    """DINO(frame_a, frame_b) 余弦相似度（复用 _dino_feat；与 revisit_metric_sanity 同算法）。
+
+    两帧各过 _dino_feat（lazy-load DINOv2，无骨干）取 pooled 特征再算 cosine。任一帧特征
+    算不出（DINO 不可用）→ None（graceful，调用方据此不过滤该 case）。
+    """
+    fa = _dino_feat(frame_a, device)
+    fb = _dino_feat(frame_b, device)
+    if fa is None or fb is None:
+        return None
+    cos = F.cosine_similarity(fa.unsqueeze(0), fb.unsqueeze(0), dim=-1)
+    return float(cos.item())
+
+
+def _case_gt_ceiling(frames: np.ndarray, pt: RevisitPoint,
+                     device: torch.device,
+                     filter_rng: np.random.Generator) -> Tuple[Optional[float], Optional[float]]:
+    """算单 case 的 GT 天花板：(d_vr, d_vrand)。
+
+    d_vr    = DINO(GT[first_visit_frame], GT[query_frame])   —— 同地点真值一致性（天花板）。
+    d_vrand = DINO(GT[first_visit_frame], 随机历史帧)         —— 随机对照（_pick_random_hist_frame）。
+    两帧越界 / 随机帧取不到 → 对应值 None（graceful）。
+    """
+    T = frames.shape[0]
+    fi = int(pt.first_visit_frame)
+    qi = int(pt.query_frame)
+    if not (0 <= fi < T and 0 <= qi < T):
+        return None, None
+    d_vr = _dino_cosine(frames[fi], frames[qi], device)
+    ri = _pick_random_hist_frame(pt, T, filter_rng)
+    d_vrand = _dino_cosine(frames[fi], frames[int(ri)], device) if ri is not None else None
+    return d_vr, d_vrand
+
+
+def _keep_real_revisit(d_vr: Optional[float], d_vrand: Optional[float], args) -> bool:
+    """保留判据：d_vr - d_vrand >= min_ceiling_delta **且** d_vr >= min_ceiling_abs。
+
+    graceful：DINO 不可用（d_vr is None）→ 保留（不因 DINO 装载失败误删全部 case）。
+    d_vrand 单独 None（随机帧取不到）→ 只用绝对下限 min_ceiling_abs 判。
+    """
+    if d_vr is None:
+        return True  # DINO 不可用 → 不过滤（避免全丢）
+    if d_vr < args.min_ceiling_abs:
+        return False
+    if d_vrand is not None and (d_vr - d_vrand) < args.min_ceiling_delta:
+        return False
+    return True
+
+
+def _enumerate_and_filter_cases(ep_ids, ep_groups, args, min_time_gap_frames,
+                                device, height, width):
+    """枚举 revisit case 全集 →（可选）GT 天花板过滤真重访 → 取前 max_cases。
+
+    **`_enumerate_cases` 的过滤增强版**，与其返回同构 `(ordered_cases, ep_cache)`，供定量主
+    路径 + 定性路径共用（分片仍由调用方对返回列表按全局序号取模，确定性、并集完整、不重不漏）。
+
+    - `--no_ceiling_filter`：**逐位回退** `_enumerate_cases(ep_ids, ep_groups, args, ...)`
+      （含其内部 max_cases 截断），与加过滤前完全一致。
+    - `--ceiling_filter`（默认 on）：先以 **max_cases=0** 枚举**完整**全集（否则 max_cases
+      名额会被假重访占掉）→ 逐 case 算 GT 天花板过滤 → 对**已过滤**列表取前 max_cases。
+      过滤发生在 max_cases 与分片**之前**（枚举全集 → 过滤 → 取 max_cases → 分片）。
+    """
+    if not args.ceiling_filter:
+        return _enumerate_cases(ep_ids, ep_groups, args, min_time_gap_frames)
+
+    # 枚举完整全集（禁用 max_cases：先过滤后截断，防假重访占名额）
+    args_full = argparse.Namespace(**vars(args))
+    args_full.max_cases = 0
+    ordered_cases, ep_cache = _enumerate_cases(
+        ep_ids, ep_groups, args_full, min_time_gap_frames)
+    if not ordered_cases:
+        return ordered_cases, ep_cache
+
+    # 过滤用**独立** rng（不扰动主生成 rng → anchor_random 选取与 no_ceiling_filter 一致）
+    filter_rng = np.random.default_rng(args.seed)
+
+    # 按 episode 分组（保持全局序），逐 episode 解码一次算 DINO 天花板（不加载骨干）
+    from collections import OrderedDict
+    by_ep: "OrderedDict[str, List[RevisitPoint]]" = OrderedDict()
+    for ep_id, pt in ordered_cases:
+        by_ep.setdefault(ep_id, []).append(pt)
+
+    keep_flags: Dict[Tuple[str, int], bool] = {}
+    for ep_id, pts in by_ep.items():
+        ep = ep_cache[ep_id]
+        try:
+            frames = _decode_episode_video(ep, height=height, width=width)  # [T,3,H,W]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("天花板过滤：episode %s 解码失败: %s；该 episode 全部 case 保留"
+                           "（不因解码失败误删）", ep_id, exc)
+            for pt in pts:
+                keep_flags[(ep_id, int(pt.query_frame))] = True
+            continue
+        for pt in pts:
+            d_vr, d_vrand = _case_gt_ceiling(frames, pt, device, filter_rng)
+            keep = _keep_real_revisit(d_vr, d_vrand, args)
+            keep_flags[(ep_id, int(pt.query_frame))] = keep
+            _s_vr = "nan" if d_vr is None else f"{d_vr:.4f}"
+            _s_vrand = "nan" if d_vrand is None else f"{d_vrand:.4f}"
+            if keep:
+                logger.info("kept real-revisit ep=%s q=%d d_vr=%s d_vrand=%s",
+                            ep_id, pt.query_frame, _s_vr, _s_vrand)
+            else:
+                logger.info("dropped fake-revisit ep=%s q=%d d_vr=%s d_vrand=%s",
+                            ep_id, pt.query_frame, _s_vr, _s_vrand)
+        del frames
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    filtered = [(ep_id, pt) for (ep_id, pt) in ordered_cases
+                if keep_flags.get((ep_id, int(pt.query_frame)), True)]
+    n_dropped = len(ordered_cases) - len(filtered)
+    logger.info("GT 天花板过滤：全集 %d → 保留 %d（丢弃 %d 假重访），"
+                "min_ceiling_delta=%.3f min_ceiling_abs=%.3f",
+                len(ordered_cases), len(filtered), n_dropped,
+                args.min_ceiling_delta, args.min_ceiling_abs)
+
+    # 过滤后再取前 max_cases（名额只给真重访）
+    if args.max_cases > 0 and len(filtered) > args.max_cases:
+        filtered = filtered[:args.max_cases]
+        logger.info("过滤后取前 max_cases=%d 个", args.max_cases)
+
+    return filtered, ep_cache
+
+
+# ---------------------------------------------------------------------------
 # per_window.csv（增量写，抗崩 / 抗分片）
 # ---------------------------------------------------------------------------
 
@@ -602,9 +755,10 @@ def _render_qualitative(wan_i2v, ep_groups, ep_ids, args, device, rng,
     logger.info("定性渲染：qual_arms=%s num_clips=%d frame_num=%d fps=%d",
                 qual_arms, num_clips, args.frame_num, args.fps)
 
-    ordered_cases, ep_cache = _enumerate_cases(ep_ids, ep_groups, args, min_time_gap_frames)
+    ordered_cases, ep_cache = _enumerate_and_filter_cases(
+        ep_ids, ep_groups, args, min_time_gap_frames, device, height, width)
     if not ordered_cases:
-        logger.error("定性渲染：无 revisit case，退出。")
+        logger.error("定性渲染：无 revisit case（或全被天花板过滤丢弃），退出。")
         return
 
     if args.shard_count > 1:
@@ -830,9 +984,10 @@ def main():
     run_dir_str = str(run_dir)
 
     # ---- 定量：枚举完整 case 全集（max_cases 在切分前应用）→ 单卡 or 分片 ----
-    ordered_cases, ep_cache = _enumerate_cases(ep_ids, ep_groups, args, min_time_gap_frames)
+    ordered_cases, ep_cache = _enumerate_and_filter_cases(
+        ep_ids, ep_groups, args, min_time_gap_frames, device, height, width)
     if not ordered_cases:
-        logger.error("无 revisit case，退出。")
+        logger.error("无 revisit case（或全被天花板过滤丢弃），退出。")
         return
     if args.shard_count > 1:
         sel = [(gi, e, p) for gi, (e, p) in enumerate(ordered_cases)

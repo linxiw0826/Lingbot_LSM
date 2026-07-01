@@ -36,8 +36,13 @@ METADATA="${METADATA:-metadata_verify_train.csv}"
 
 # ---- 臂 / 上限 / 多 clip ----
 ARMS="${ARMS:-off,anchor_ideal,anchor_random}"   # 诊断臂子集
-MAX_CASES="${MAX_CASES:-5}"                       # case 全局上限（切分前应用）
+MAX_CASES="${MAX_CASES:-5}"                       # case 全局上限（天花板过滤后、切分前应用）
 NUM_CLIPS="${NUM_CLIPS:-5}"                       # 多 clip 自回归 clip 数（5×81≈25s）
+
+# ---- GT 天花板过滤（真重访筛选；丢弃几何匹配到的假重访；默认 on）----
+CEILING_FILTER="${CEILING_FILTER:-on}"            # on=过滤真重访（默认）/ off=跑全部 case（对照）
+MIN_CEILING_DELTA="${MIN_CEILING_DELTA:-0.1}"     # 保留判据 Δ：d_vr - d_vrand >= 此值
+MIN_CEILING_ABS="${MIN_CEILING_ABS:-0.5}"         # 保留判据绝对下限：d_vr >= 此值
 
 # ---- 注入源 / prompt 对齐 ----
 RETRIEVAL="${RETRIEVAL:-gt_oracle}"              # gt_oracle（默认隔离注入）/ bank（未实现）
@@ -112,8 +117,11 @@ echo "  FT_HIGH_MODEL_DIR   : ${FT_HIGH_MODEL_DIR:-<无>}"
 echo "  DATASET_DIR         : ${DATASET_DIR}"
 echo "  METADATA            : ${METADATA}"
 echo "  ARMS                : ${ARMS}"
-echo "  MAX_CASES           : ${MAX_CASES}（case 全集上限；在按 case 取模切分前应用）"
+echo "  MAX_CASES           : ${MAX_CASES}（case 上限；在天花板过滤后、按 case 取模切分前应用）"
 echo "  NUM_CLIPS           : ${NUM_CLIPS}"
+echo "  CEILING_FILTER      : ${CEILING_FILTER}（on=丢弃假重访；off=跑全部 case）"
+echo "  MIN_CEILING_DELTA   : ${MIN_CEILING_DELTA}"
+echo "  MIN_CEILING_ABS     : ${MIN_CEILING_ABS}"
 echo "  RETRIEVAL           : ${RETRIEVAL}"
 echo "  PROMPT_SOURCE       : ${PROMPT_SOURCE}"
 echo "  GO_MARGIN           : ${GO_MARGIN}"
@@ -146,6 +154,8 @@ for i in $(seq 0 $((NUM_SHARDS - 1))); do
         --arms                  "${ARMS}"
         --max_cases             "${MAX_CASES}"
         --num_clips             "${NUM_CLIPS}"
+        --min_ceiling_delta     "${MIN_CEILING_DELTA}"
+        --min_ceiling_abs       "${MIN_CEILING_ABS}"
         --retrieval             "${RETRIEVAL}"
         --prompt_source         "${PROMPT_SOURCE}"
         --prompt                "${PROMPT}"
@@ -162,6 +172,10 @@ for i in $(seq 0 $((NUM_SHARDS - 1))); do
     if [ -n "${FT_HIGH_MODEL_DIR}" ]; then
         SHARD_ARGS+=(--ft_high_model_dir "${FT_HIGH_MODEL_DIR}")
     fi
+    # 天花板过滤默认 on（python 侧 default=True）；仅当显式关闭时透传 --no_ceiling_filter
+    case "${CEILING_FILTER,,}" in
+        off|false|0|no) SHARD_ARGS+=(--no_ceiling_filter) ;;
+    esac
 
     shard_log="${LOG_DIR}/shard_${i}.log"
     echo "  [shard ${i}] GPU=${gpu} → ${shard_run_dir} (log: ${shard_log})"
