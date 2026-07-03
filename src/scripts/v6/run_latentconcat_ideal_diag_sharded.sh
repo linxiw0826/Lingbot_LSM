@@ -6,9 +6,12 @@ set -euo pipefail
 # ============================================================
 # v6 latent-concat 理想注入诊断（S-V5 / Step 44）—— **多卡分片版**
 # （off / anchor_ideal / anchor_random，多 clip 自回归 × frame-aligned DINO）。
-# 把 revisit case 全集（先 detect 完整列表，再在切分前应用 --max_cases 全局上限）按 **case
-# 全局序号取模** 切成 NUM_SHARDS 份，每张卡跑一个 shard（不同 --tag → 独立 run_dir，无
-# per_window.csv 并发写冲突），全部跑完后用 merge_v6_shards.py 合并出三臂 GO/NO-GO 判决。
+# 流程（Phase A0 修改 A，治本分片确定性）：
+#   ① 单进程先跑 --emit_manifest → 枚举 + 天花板过滤 + max_cases 截断 → 落盘确定性 case manifest；
+#   ② 各卡 shard 只读该 manifest（--cases_manifest），按 **case 全局序号取模** 切 NUM_SHARDS 份，
+#      各 shard 看**逐字节相同**的有序全集 → 切分不重不叠（治本 ep05_p09/q560 跨 shard 重复）；
+#   ③ 全部跑完用 merge_v6_shards.py 合并（去重 + status 排除 + 三口径判决）出三臂 GO/NO-GO。
+# 各 shard 用不同 --tag → 独立 run_dir，无 per_window.csv 并发写冲突。
 #
 # 产出布局（走 paths.py，version=v6）：
 #   OUTPUT_ROOT/v6/eval/<run_name>/<tag>_s0/   ← shard 0 的 per_window.csv + videos/
@@ -105,6 +108,9 @@ fi
 # ---- 合并后的 run_dir 路径（与 paths.eval_run_dir 布局一致，version=v6）----
 MERGE_OUT_DIR="${OUTPUT_ROOT}/v6/eval/${RUN_NAME}/${TAG}"
 
+# ---- 确定性 case manifest 路径（Phase A0 修改 A：全体 shard 消费同一份，切分不重不漏）----
+MANIFEST_PATH="${MERGE_OUT_DIR}/cases_manifest.json"
+
 # ---- 日志目录 ----
 LOG_DIR="${PROJECT_ROOT}/logs/run_latentconcat_ideal_diag_sharded"
 mkdir -p "${LOG_DIR}"
@@ -131,15 +137,63 @@ echo "  RUN_NAME            : ${RUN_NAME}"
 echo "  TAG                 : ${TAG}（shard tag = ${TAG}_s<i>）"
 echo "  OUTPUT_ROOT         : ${OUTPUT_ROOT}"
 echo "  合并目标            : ${MERGE_OUT_DIR}"
-echo "  LOG_DIR             : ${LOG_DIR}/shard_<i>.log"
+echo "  MANIFEST_PATH       : ${MANIFEST_PATH}（单进程先 emit，各 shard 共读）"
+echo "  LOG_DIR             : ${LOG_DIR}/shard_<i>.log（manifest.log 为 emit 阶段）"
 echo "  判据                : anchor_ideal DINO > off+margin 且 > anchor_random+margin（合并后判）"
 echo "====================================================="
+
+# ============================================================
+# 修改 A：先用**单进程**（占一张卡）跑一次 --emit_manifest，落盘确定性 case manifest。
+# 各 shard 随后只读该 manifest（不再各自重算天花板过滤），保证 gi %% N 分片不重不叠。
+# 天花板过滤只需 DINO（无骨干），emit 路径在加载 14B 骨干前 return，故很快。
+# ============================================================
+mkdir -p "${MERGE_OUT_DIR}"
+EMIT_GPU="${GPUS_ARR[0]}"
+EMIT_LOG="${LOG_DIR}/manifest.log"
+
+EMIT_ARGS=(
+    --ckpt_dir              "${CKPT_DIR}"
+    --dataset_dir           "${DATASET_DIR}"
+    --metadata              "${METADATA}"
+    --arms                  "${ARMS}"
+    --max_cases             "${MAX_CASES}"
+    --num_clips             "${NUM_CLIPS}"
+    --min_ceiling_delta     "${MIN_CEILING_DELTA}"
+    --min_ceiling_abs       "${MIN_CEILING_ABS}"
+    --retrieval             "${RETRIEVAL}"
+    --prompt_source         "${PROMPT_SOURCE}"
+    --prompt                "${PROMPT}"
+    --run_name              "${RUN_NAME}"
+    --tag                   "${TAG}_manifest"
+    --device                "cuda:0"
+    --emit_manifest         "${MANIFEST_PATH}"
+)
+if [ -n "${FT_MODEL_DIR}" ]; then
+    EMIT_ARGS+=(--ft_model_dir "${FT_MODEL_DIR}")
+fi
+if [ -n "${FT_HIGH_MODEL_DIR}" ]; then
+    EMIT_ARGS+=(--ft_high_model_dir "${FT_HIGH_MODEL_DIR}")
+fi
+case "${CEILING_FILTER,,}" in
+    off|false|0|no) EMIT_ARGS+=(--no_ceiling_filter) ;;
+esac
+
+echo ""
+echo "===== 生成确定性 case manifest（单进程，GPU=${EMIT_GPU}）→ ${MANIFEST_PATH} ====="
+echo "  (log: ${EMIT_LOG})"
+CUDA_VISIBLE_DEVICES="${EMIT_GPU}" TMPDIR=/tmp python "${DIAG_SCRIPT}" "${EMIT_ARGS[@]}" \
+    2>&1 | tee "${EMIT_LOG}"
+if [ ! -f "${MANIFEST_PATH}" ]; then
+    echo "[ERROR] manifest 生成失败：${MANIFEST_PATH} 不存在（详见 ${EMIT_LOG}）" >&2
+    exit 1
+fi
+echo "  manifest 就绪：${MANIFEST_PATH}"
 
 declare -a SHARD_DIRS
 declare -a SHARD_PIDS
 
 echo ""
-echo "===== 并发启动 ${NUM_SHARDS} 个 shard ====="
+echo "===== 并发启动 ${NUM_SHARDS} 个 shard（各读同一 manifest，切分不重不漏）====="
 
 for i in $(seq 0 $((NUM_SHARDS - 1))); do
     gpu="${GPUS_ARR[$i]}"
@@ -165,6 +219,7 @@ for i in $(seq 0 $((NUM_SHARDS - 1))); do
         --device                "cuda:0"
         --shard_index           "${i}"
         --shard_count           "${NUM_SHARDS}"
+        --cases_manifest        "${MANIFEST_PATH}"
     )
     if [ -n "${FT_MODEL_DIR}" ]; then
         SHARD_ARGS+=(--ft_model_dir "${FT_MODEL_DIR}")
@@ -210,7 +265,8 @@ done
 python "${MERGE_SCRIPT}" \
     --shard_dirs "${MERGE_SHARD_ARGS[@]}" \
     --out_dir    "${MERGE_OUT_DIR}" \
-    --margin     "${GO_MARGIN}"
+    --margin     "${GO_MARGIN}" \
+    --manifest   "${MANIFEST_PATH}"
 
 echo ""
 echo "===== v6 分片诊断完成 ====="

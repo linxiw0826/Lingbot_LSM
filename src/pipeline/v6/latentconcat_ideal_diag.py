@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import logging
 import os
 import shutil
@@ -113,6 +114,7 @@ import pipeline.eval.oracle_injection as _oracle_inj  # noqa: E402
 from pipeline.eval.retrieval_probe import (  # noqa: E402
     EpisodeData,
     load_episode_clips,
+    build_episode_data,
     _decode_episode_video,
 )
 
@@ -265,6 +267,20 @@ def _parse_args():
                    help="当前分片索引（0-based），多卡并行诊断用。默认 0。")
     p.add_argument("--shard_count", type=int, default=1,
                    help="总分片数。默认 1=不分片（走原始路径）；>1 时按 case 全局序号取模分片。")
+
+    # ---- 确定性 case manifest（治本：全体 shard 消费同一份 case 列表，见 Phase A0 修改 A）----
+    # 分片切分不重不漏的前提是各 shard 看到**逐字节相同**的有序 case 全集。天花板过滤依赖
+    # DINO 前向（GPU 非确定）+ filter_rng（随机抽历史帧），borderline case 的 keep 一翻转，
+    # 全局序号 gi 整体错位 → gi % N 在各独立进程里切出既重叠又漏的划分（ep05_p09/q560 曾落进
+    # 两个 shard）。解法：枚举+过滤**只跑一次**落盘成 manifest，所有 shard 只读该 manifest。
+    p.add_argument("--emit_manifest", type=str, default=None,
+                   help="（与 --cases_manifest 互斥）单进程模式：跑完枚举+天花板过滤+max_cases 截断，"
+                        "把最终有序 case 列表（含 RevisitPoint 全字段 + d_vr/d_vrand/keep 诊断量）"
+                        "序列化为 JSON 落盘到该路径，然后退出，**不生成视频**。")
+    p.add_argument("--cases_manifest", type=str, default=None,
+                   help="（与 --emit_manifest 互斥）若给定且文件存在 → 跳过现场枚举+过滤，直接从该 "
+                        "JSON 反序列化出有序 case 全集，再走 gi %% shard_count 分片（保证各 shard 看"
+                        "同一确定性全集，切分不重不漏）。文件不存在 → 回退现场枚举+过滤（附 warning）。")
 
     return p.parse_args()
 
@@ -508,7 +524,7 @@ def _keep_real_revisit(d_vr: Optional[float], d_vrand: Optional[float], args) ->
 
 
 def _enumerate_and_filter_cases(ep_ids, ep_groups, args, min_time_gap_frames,
-                                device, height, width):
+                                device, height, width, diag_out=None):
     """枚举 revisit case 全集 →（可选）GT 天花板过滤真重访 → 取前 max_cases。
 
     **`_enumerate_cases` 的过滤增强版**，与其返回同构 `(ordered_cases, ep_cache)`，供定量主
@@ -519,6 +535,10 @@ def _enumerate_and_filter_cases(ep_ids, ep_groups, args, min_time_gap_frames,
     - `--ceiling_filter`（默认 on）：先以 **max_cases=0** 枚举**完整**全集（否则 max_cases
       名额会被假重访占掉）→ 逐 case 算 GT 天花板过滤 → 对**已过滤**列表取前 max_cases。
       过滤发生在 max_cases 与分片**之前**（枚举全集 → 过滤 → 取 max_cases → 分片）。
+
+    `diag_out`（可选，Phase A0 修改 A/D）：若传入 dict，则以 `(ep_id, query_frame)` 为键写入每个
+    **保留 case** 的过滤诊断量 `{"d_vr", "d_vrand", "keep"}`，供 --emit_manifest 序列化进 manifest
+    （天花板强度观测，见修改 D）。no_ceiling_filter 分支无诊断量，diag_out 保持为空。
     """
     if not args.ceiling_filter:
         return _enumerate_cases(ep_ids, ep_groups, args, min_time_gap_frames)
@@ -555,6 +575,9 @@ def _enumerate_and_filter_cases(ep_ids, ep_groups, args, min_time_gap_frames,
             d_vr, d_vrand = _case_gt_ceiling(frames, pt, device, filter_rng)
             keep = _keep_real_revisit(d_vr, d_vrand, args)
             keep_flags[(ep_id, int(pt.query_frame))] = keep
+            if diag_out is not None:
+                diag_out[(ep_id, int(pt.query_frame))] = {
+                    "d_vr": d_vr, "d_vrand": d_vrand, "keep": bool(keep)}
             _s_vr = "nan" if d_vr is None else f"{d_vr:.4f}"
             _s_vrand = "nan" if d_vrand is None else f"{d_vrand:.4f}"
             if keep:
@@ -584,6 +607,172 @@ def _enumerate_and_filter_cases(ep_ids, ep_groups, args, min_time_gap_frames,
 
 
 # ---------------------------------------------------------------------------
+# 确定性 case manifest（Phase A0 修改 A：全体 shard 消费同一份有序 case 列表）
+#
+#   生产方 = --emit_manifest 路径（单进程枚举+过滤+截断 → 落盘 JSON）。
+#   消费方 = --cases_manifest 路径（各 shard 反序列化 → gi %% shard_count 分片）。
+#   契约：JSON 顶层 {schema_version, created, ceiling_filter, min_ceiling_delta,
+#     min_ceiling_abs, max_cases, retrieval, num_cases, cases:[...]}；每个 case
+#     {episode_id, query_frame, first_visit_frame, gt_past_frames, d_vr, d_vrand, keep}。
+#     cases **已按 (episode_id, query_frame) 稳定排序**，各 shard 读同一顺序 → 切分不重不漏。
+# ---------------------------------------------------------------------------
+
+_MANIFEST_SCHEMA_VERSION = 1
+
+
+def _revisitpoint_to_dict(ep_id: str, pt: RevisitPoint,
+                          diag: Optional[Dict]) -> Dict:
+    """RevisitPoint（+ 可选过滤诊断）→ JSON-safe dict。
+
+    RevisitPoint 全字段（见 oracle_injection.py:310-315）：episode_id / query_frame /
+    first_visit_frame / gt_past_frames，全部序列化以便消费方**完整还原**。
+    """
+    d = {
+        "episode_id": str(ep_id),
+        "query_frame": int(pt.query_frame),
+        "first_visit_frame": int(pt.first_visit_frame),
+        "gt_past_frames": [int(x) for x in (pt.gt_past_frames or [])],
+    }
+    if diag is not None:
+        d["d_vr"] = None if diag.get("d_vr") is None else float(diag["d_vr"])
+        d["d_vrand"] = None if diag.get("d_vrand") is None else float(diag["d_vrand"])
+        d["keep"] = bool(diag.get("keep", True))
+    return d
+
+
+def _dict_to_revisitpoint(d: Dict) -> RevisitPoint:
+    """JSON dict → RevisitPoint（完整还原；缺 gt_past_frames 时退化为空 list）。"""
+    return RevisitPoint(
+        episode_id=str(d["episode_id"]),
+        query_frame=int(d["query_frame"]),
+        first_visit_frame=int(d["first_visit_frame"]),
+        gt_past_frames=[int(x) for x in d.get("gt_past_frames", [])],
+    )
+
+
+def _sort_ordered_cases(ordered_cases: List) -> List:
+    """按稳定键 (episode_id, query_frame) 排序，防御 dict/set 迭代序，保证分片确定性。"""
+    return sorted(ordered_cases, key=lambda ep_pt: (str(ep_pt[0]), int(ep_pt[1].query_frame)))
+
+
+def _write_cases_manifest(path: str, ordered_cases: List,
+                          diag_out: Optional[Dict], args) -> None:
+    """把最终有序 case 列表（+ 过滤诊断量）序列化落盘为确定性 manifest（生产方）。"""
+    cases_sorted = _sort_ordered_cases(ordered_cases)
+    cases_json = []
+    for ep_id, pt in cases_sorted:
+        diag = diag_out.get((str(ep_id), int(pt.query_frame))) if diag_out else None
+        cases_json.append(_revisitpoint_to_dict(ep_id, pt, diag))
+    payload = {
+        "schema_version": _MANIFEST_SCHEMA_VERSION,
+        "created": datetime.now().isoformat(),
+        "ceiling_filter": bool(args.ceiling_filter),
+        "min_ceiling_delta": float(args.min_ceiling_delta),
+        "min_ceiling_abs": float(args.min_ceiling_abs),
+        "max_cases": int(args.max_cases),
+        "retrieval": str(args.retrieval),
+        "num_cases": len(cases_json),
+        "cases": cases_json,
+    }
+    out_dir = os.path.dirname(os.path.abspath(path))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, ensure_ascii=False)
+
+
+def _load_cases_manifest(path: str) -> Tuple[List, Dict]:
+    """从 manifest 反序列化有序 case 全集（消费方）。
+
+    Returns:
+        (ordered_cases, payload)
+        ordered_cases: List[(ep_id, RevisitPoint)]，按 (episode_id, query_frame) 稳定排序
+          （防御性 re-sort，即便生产方顺序被外部改动仍确定）。
+    """
+    with open(path, "r", encoding="utf-8") as fh:
+        payload = json.load(fh)
+    cases = payload.get("cases", [])
+    ordered = [(str(c["episode_id"]), _dict_to_revisitpoint(c)) for c in cases]
+    ordered = _sort_ordered_cases(ordered)
+    return ordered, payload
+
+
+def _get_episode(ep_cache: Dict, ep_id: str, ep_groups: Dict, args) -> Optional[EpisodeData]:
+    """惰性取 EpisodeData：ep_cache 命中直接返回，否则 build 并缓存（manifest 模式各 shard 自建）。
+
+    manifest 消费路径下 ep_cache 初始为空（枚举未跑），各 shard 只为**它分到的** episode
+    调 build_episode_data（自行解码它分到的 episode 视频），不重跑全集枚举。
+    """
+    ep = ep_cache.get(ep_id)
+    if ep is not None:
+        return ep
+    if ep_id not in ep_groups:
+        logger.warning("episode %s 不在 metadata CSV（manifest 与数据集不匹配？），跳过", ep_id)
+        return None
+    ep = build_episode_data(ep_id, ep_groups[ep_id],
+                            clip_overlap_frames=args.clip_overlap_frames)
+    if ep is None:
+        logger.warning("episode %s build_episode_data 失败，跳过", ep_id)
+        return None
+    ep_cache[ep_id] = ep
+    return ep
+
+
+def _resolve_ordered_cases(args, ep_ids, ep_groups, min_time_gap_frames,
+                           device, height, width) -> Tuple[List, Dict]:
+    """统一 case 来源：优先读 --cases_manifest（确定性、跳过枚举+过滤），否则现场枚举+过滤。
+
+    manifest 命中 → 返回 (ordered_cases, {})，ep_cache 空（后续 _get_episode 惰性 build）。
+    manifest 缺失但指定了 → warning 后回退现场枚举（单进程仍安全；多进程分片应先 emit_manifest）。
+    """
+    if args.cases_manifest and os.path.exists(args.cases_manifest):
+        ordered_cases, _payload = _load_cases_manifest(args.cases_manifest)
+        logger.info("从 cases_manifest 加载 %d 个 case（跳过现场枚举+过滤）：%s",
+                    len(ordered_cases), args.cases_manifest)
+        return ordered_cases, {}
+    if args.cases_manifest:
+        logger.warning("--cases_manifest 指定但文件不存在（%s）→ 回退现场枚举+过滤"
+                       "（分片下各进程独立枚举有不重不漏风险，建议先 --emit_manifest）",
+                       args.cases_manifest)
+    return _enumerate_and_filter_cases(
+        ep_ids, ep_groups, args, min_time_gap_frames, device, height, width)
+
+
+def _shard_and_dedup(ordered_cases: List, args) -> List:
+    """对有序 case 全集按 gi %% shard_count 分片 + 防御性去重（Phase A0 修改 B）。
+
+    Returns: sel = List[(gi, ep_id, pt)]，本 shard 内 (episode_id, query_frame) 唯一。
+    去重后 assert 无重复（治本靠 manifest 保证不重叠，这里是第二道防线，兜异常输入）。
+    """
+    if args.shard_count > 1:
+        sel = [(gi, e, p) for gi, (e, p) in enumerate(ordered_cases)
+               if gi % args.shard_count == args.shard_index]
+    else:
+        sel = [(gi, e, p) for gi, (e, p) in enumerate(ordered_cases)]
+
+    seen: set = set()
+    deduped: List = []
+    dropped = 0
+    for gi, e, p in sel:
+        key = (str(e), int(p.query_frame))
+        if key in seen:
+            dropped += 1
+            logger.warning("shard %d/%d 去重：丢弃重复 case ep=%s q=%d",
+                           args.shard_index, args.shard_count, e, p.query_frame)
+            continue
+        seen.add(key)
+        deduped.append((gi, e, p))
+    if dropped:
+        logger.warning("shard %d/%d：共去重 %d 个重复 case", args.shard_index,
+                       args.shard_count, dropped)
+    # assert 本 shard 内无重复 case（去重后必然成立；作显式不变量检查）
+    _keys = [(str(e), int(p.query_frame)) for _gi, e, p in deduped]
+    assert len(_keys) == len(set(_keys)), \
+        f"shard {args.shard_index}/{args.shard_count} 仍含重复 case: {_keys}"
+    return deduped
+
+
+# ---------------------------------------------------------------------------
 # per_window.csv（增量写，抗崩 / 抗分片）
 # ---------------------------------------------------------------------------
 
@@ -593,6 +782,7 @@ _CSV_FIELDS = [
     "video_path", "gt_first_visit_png",
     "dino_max", "dino_mean", "dino_last",      # DINO（主判据）
     "ssim_max", "ssim_mean", "ssim_last",      # SSIM（对照）
+    "status",                                  # ok / dino_empty / error（修改 C：空值不静默）
 ]
 
 
@@ -609,11 +799,33 @@ def _append_csv(run_dir: str, record: Dict) -> None:
         logger.warning("写 per_window.csv 失败: %s", exc)
 
 
+def _is_bad_dino(v) -> bool:
+    """dino_mean 是否为 None / NaN（打分失败标记，修改 C：不静默写空当成功）。"""
+    if v is None:
+        return True
+    try:
+        return v != v  # NaN
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def _score_and_record(all_records, run_dir, args, ep_id, pt, arm, video, gt_first,
                       mp4_path, gt_png_path, win_start, revisit_clip_idx,
                       device) -> Optional[float]:
-    """算 DINO + SSIM → record → append + 落盘。返回 dino_mean（判据用）。"""
-    metrics = _revisit_consistency(video, gt_first, device=device)
+    """算 DINO + SSIM → record → append + 落盘。返回 dino_mean（判据用）。
+
+    修改 C（DINO 空值不静默）：打分抛异常 → status=error；dino_mean 为 None/NaN → status=
+    dino_empty；均记 logger.warning（含 ep/q/arm/win）。正常行 status=ok。merge 侧 GO/NO-GO
+    统计排除 status != ok 的行。
+    """
+    status = "ok"
+    try:
+        metrics = _revisit_consistency(video, gt_first, device=device)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("DINO/SSIM 打分抛异常 ep=%s q=%d arm=%s win_start=%d：%s",
+                       ep_id, pt.query_frame, arm, win_start, exc)
+        metrics = {}
+        status = "error"
     record = {
         "episode_id": ep_id, "query_frame": pt.query_frame,
         "first_visit_frame": pt.first_visit_frame, "arm": arm,
@@ -628,12 +840,18 @@ def _score_and_record(all_records, run_dir, args, ep_id, pt, arm, video, gt_firs
         "ssim_mean": metrics.get("revisit_consistency_mean"),
         "ssim_last": metrics.get("revisit_consistency_last"),
     }
-    logger.info("ep=%s q=%d [%s] dino_mean=%s ssim_mean=%s",
-                ep_id, pt.query_frame, arm, record["dino_mean"], record["ssim_mean"])
+    if status == "ok" and _is_bad_dino(record["dino_mean"]):
+        logger.warning("DINO 打分为空/NaN（不静默）ep=%s q=%d arm=%s win_start=%d "
+                       "→ 标记 status=dino_empty（不计入 GO/NO-GO）",
+                       ep_id, pt.query_frame, arm, win_start)
+        status = "dino_empty"
+    record["status"] = status
+    logger.info("ep=%s q=%d [%s] dino_mean=%s ssim_mean=%s status=%s",
+                ep_id, pt.query_frame, arm, record["dino_mean"], record["ssim_mean"], status)
     all_records.append(record)
     _append_csv(run_dir, record)
     dm = record["dino_mean"]
-    return float(dm) if dm is not None else None
+    return float(dm) if (dm is not None and not _is_bad_dino(dm)) else None
 
 
 # ---------------------------------------------------------------------------
@@ -755,17 +973,13 @@ def _render_qualitative(wan_i2v, ep_groups, ep_ids, args, device, rng,
     logger.info("定性渲染：qual_arms=%s num_clips=%d frame_num=%d fps=%d",
                 qual_arms, num_clips, args.frame_num, args.fps)
 
-    ordered_cases, ep_cache = _enumerate_and_filter_cases(
-        ep_ids, ep_groups, args, min_time_gap_frames, device, height, width)
+    ordered_cases, ep_cache = _resolve_ordered_cases(
+        args, ep_ids, ep_groups, min_time_gap_frames, device, height, width)
     if not ordered_cases:
-        logger.error("定性渲染：无 revisit case（或全被天花板过滤丢弃），退出。")
+        logger.error("定性渲染：无 revisit case（或全被天花板过滤丢弃 / manifest 为空），退出。")
         return
 
-    if args.shard_count > 1:
-        sel = [(gi, e, p) for gi, (e, p) in enumerate(ordered_cases)
-               if gi % args.shard_count == args.shard_index]
-    else:
-        sel = [(gi, e, p) for gi, (e, p) in enumerate(ordered_cases)]
+    sel = _shard_and_dedup(ordered_cases, args)
     logger.info("定性渲染：case 全集 %d，本分片处理 %d（shard %d/%d，max_cases=%d 已在切分前应用）",
                 len(ordered_cases), len(sel), args.shard_index, args.shard_count, args.max_cases)
     if not sel:
@@ -779,7 +993,9 @@ def _render_qualitative(wan_i2v, ep_groups, ep_ids, args, device, rng,
         by_ep.setdefault(ep_id, []).append(pt)
 
     for ep_id, pts in by_ep.items():
-        ep = ep_cache[ep_id]
+        ep = _get_episode(ep_cache, ep_id, ep_groups, args)
+        if ep is None:
+            continue
         logger.info("定性 Episode %s：T=%d，本分片 %d 个 case", ep_id, ep.poses.shape[0], len(pts))
         try:
             frames = _decode_episode_video(ep, height=height, width=width)  # [T,3,H,W]
@@ -809,9 +1025,12 @@ def _verdict(all_records: List[Dict], arms: List[str], margin: float, run_dir: s
     """
     cases: Dict[tuple, Dict[str, float]] = {}
     for r in all_records:
+        # 修改 C：status != ok 的行（dino_empty / error）不计入 GO/NO-GO
+        if str(r.get("status", "ok")).strip().lower() not in ("", "ok"):
+            continue
         key = (r["episode_id"], r["query_frame"])
         dm = r["dino_mean"]
-        if dm is None:
+        if dm is None or _is_bad_dino(dm):
             continue
         cases.setdefault(key, {})[r["arm"]] = float(dm)
 
@@ -918,6 +1137,9 @@ def main():
     torch.manual_seed(args.seed)
     rng = np.random.default_rng(args.seed)
 
+    if args.emit_manifest and args.cases_manifest:
+        raise SystemExit("--emit_manifest 与 --cases_manifest 互斥，不能同时给定。")
+
     global _RETRIEVAL_MODE
     _RETRIEVAL_MODE = args.retrieval
     if args.retrieval == "bank":
@@ -970,6 +1192,19 @@ def main():
         logger.error("无 episode 可处理，退出。")
         return
 
+    # ---- --emit_manifest：单进程枚举+过滤+截断 → 落盘确定性 manifest → 退出（不加载骨干/不生成）----
+    # 天花板过滤只需 DINO（lazy-load，无骨干）+ 解码 GT 帧，不需要 WanI2V pipeline，故在 _load_pipeline
+    # 之前完成并 return，避免为「只出 manifest」白白装载 14B 骨干。
+    if args.emit_manifest:
+        diag_out: Dict = {}
+        ordered_cases, _ep_cache = _enumerate_and_filter_cases(
+            ep_ids, ep_groups, args, min_time_gap_frames, device, height, width,
+            diag_out=diag_out)
+        _write_cases_manifest(args.emit_manifest, ordered_cases, diag_out, args)
+        logger.info("cases manifest 已写出（%d cases）→ %s；不生成视频，退出。",
+                    len(ordered_cases), args.emit_manifest)
+        return
+
     # ---- 加载 pipeline ----
     wan_i2v = _load_pipeline(args, device)
 
@@ -983,21 +1218,16 @@ def main():
     all_records: List[Dict] = []
     run_dir_str = str(run_dir)
 
-    # ---- 定量：枚举完整 case 全集（max_cases 在切分前应用）→ 单卡 or 分片 ----
-    ordered_cases, ep_cache = _enumerate_and_filter_cases(
-        ep_ids, ep_groups, args, min_time_gap_frames, device, height, width)
+    # ---- 定量：确定性 case 全集（优先 manifest；否则现场枚举+过滤）→ 分片 + 去重 ----
+    ordered_cases, ep_cache = _resolve_ordered_cases(
+        args, ep_ids, ep_groups, min_time_gap_frames, device, height, width)
     if not ordered_cases:
-        logger.error("无 revisit case（或全被天花板过滤丢弃），退出。")
+        logger.error("无 revisit case（或全被天花板过滤丢弃 / manifest 为空），退出。")
         return
-    if args.shard_count > 1:
-        sel = [(gi, e, p) for gi, (e, p) in enumerate(ordered_cases)
-               if gi % args.shard_count == args.shard_index]
-        logger.info("分片 %d/%d：case 全集 %d，本分片处理 %d（全局序号 %% %d == %d）",
-                    args.shard_index, args.shard_count, len(ordered_cases), len(sel),
-                    args.shard_count, args.shard_index)
-    else:
-        sel = [(gi, e, p) for gi, (e, p) in enumerate(ordered_cases)]
-        logger.info("单卡路径：处理全部 %d 个 case", len(sel))
+    sel = _shard_and_dedup(ordered_cases, args)
+    logger.info("分片 %d/%d：case 全集 %d，本分片处理 %d（全局序号 %% %d == %d）",
+                args.shard_index, args.shard_count, len(ordered_cases), len(sel),
+                args.shard_count, args.shard_index)
     if not sel:
         logger.error("shard %d/%d 分到 0 个 case（全集太小？），退出。",
                      args.shard_index, args.shard_count)
@@ -1009,7 +1239,9 @@ def main():
         by_ep.setdefault(ep_id, []).append(pt)
 
     for ep_id, pts in by_ep.items():
-        ep = ep_cache[ep_id]
+        ep = _get_episode(ep_cache, ep_id, ep_groups, args)
+        if ep is None:
+            continue
         T = ep.poses.shape[0]
         logger.info("Episode %s: T=%d, 本分片 %d 个 case", ep_id, T, len(pts))
         try:
