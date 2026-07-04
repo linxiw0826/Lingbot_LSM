@@ -228,8 +228,9 @@ def _parse_args():
     # ---- 生成参数（与 stage1_upperbound 对齐；_generate_with_anchor 直接读 args 这些字段）----
     p.add_argument("--frame_num", type=int, default=81,
                    help="每 clip 帧数（4n+1）")
-    p.add_argument("--num_inference_steps", type=int, default=70,
-                   help="diffusion 采样步数")
+    p.add_argument("--num_inference_steps", type=int, default=40,
+                   help="diffusion 采样步数（诊断闸门默认 40：三臂同步数、比相对差，"
+                        "40 落在 Wan2.2 正常工作区间，相对 70 提速 ~1.75× 且判决不失真）")
     p.add_argument("--sample_shift", type=float, default=10.0)
     p.add_argument("--guide_scale", type=float, default=5.0)
     p.add_argument("--size", type=str, default="480*832", help="分辨率 H*W")

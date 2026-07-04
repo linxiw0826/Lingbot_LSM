@@ -40,7 +40,8 @@ METADATA="${METADATA:-metadata_verify_train.csv}"
 # ---- 臂 / 上限 / 多 clip ----
 ARMS="${ARMS:-off,anchor_ideal,anchor_random}"   # 诊断臂子集
 MAX_CASES="${MAX_CASES:-5}"                       # case 全局上限（天花板过滤后、切分前应用）
-NUM_CLIPS="${NUM_CLIPS:-5}"                       # 多 clip 自回归 clip 数（5×81≈25s）
+NUM_CLIPS="${NUM_CLIPS:-3}"                       # 多 clip 自回归 clip 数（3×81≈15s；够覆盖重访）
+STEPS="${STEPS:-40}"                              # diffusion 采样步数（默认 40；三臂同步数比相对差，判决不失真）
 
 # ---- GT 天花板过滤（真重访筛选；丢弃几何匹配到的假重访；默认 on）----
 CEILING_FILTER="${CEILING_FILTER:-on}"            # on=过滤真重访（默认）/ off=跑全部 case（对照）
@@ -125,6 +126,7 @@ echo "  METADATA            : ${METADATA}"
 echo "  ARMS                : ${ARMS}"
 echo "  MAX_CASES           : ${MAX_CASES}（case 上限；在天花板过滤后、按 case 取模切分前应用）"
 echo "  NUM_CLIPS           : ${NUM_CLIPS}"
+echo "  STEPS               : ${STEPS}（diffusion 采样步数）"
 echo "  CEILING_FILTER      : ${CEILING_FILTER}（on=丢弃假重访；off=跑全部 case）"
 echo "  MIN_CEILING_DELTA   : ${MIN_CEILING_DELTA}"
 echo "  MIN_CEILING_ABS     : ${MIN_CEILING_ABS}"
@@ -208,6 +210,7 @@ for i in $(seq 0 $((NUM_SHARDS - 1))); do
         --arms                  "${ARMS}"
         --max_cases             "${MAX_CASES}"
         --num_clips             "${NUM_CLIPS}"
+        --num_inference_steps   "${STEPS}"
         --min_ceiling_delta     "${MIN_CEILING_DELTA}"
         --min_ceiling_abs       "${MIN_CEILING_ABS}"
         --retrieval             "${RETRIEVAL}"
