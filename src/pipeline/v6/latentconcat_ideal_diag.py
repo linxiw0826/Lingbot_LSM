@@ -913,6 +913,17 @@ def _process_case(wan_i2v, ep, ep_id, pt, frames, args, device, rng,
             continue
         revisit_video = clip_videos[-1]   # [3,frame_num,H,W]，重访 clip
         _save_video(revisit_video, mp4_path, fps=args.fps)
+        # 额外落盘：完整多 clip 自回归长视频（仅供肉眼定性查看，不参与打分）
+        full_mp4_path = os.path.join(q_dir, f"{arm}_full.mp4")
+        if os.path.exists(full_mp4_path):
+            logger.info("ep=%s q=%d [%s]：full mp4 已存在 → 跳过重存",
+                        ep_id, pt.query_frame, arm)
+        else:
+            full_video = np.concatenate(clip_videos, axis=1)   # [3, num_clips*frame_num, H, W]
+            _save_video(full_video, full_mp4_path, fps=args.fps)
+            logger.info("ep=%s q=%d [%s]：完整长视频已存 → %s（%d 帧 @ %dfps）",
+                        ep_id, pt.query_frame, arm, full_mp4_path,
+                        full_video.shape[1], args.fps)
         _score_and_record(all_records, run_dir, args, ep_id, pt, arm,
                           revisit_video, gt_first, mp4_path, gt_png_path,
                           win_start, revisit_clip_idx, device)
