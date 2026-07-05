@@ -33,7 +33,7 @@ PHASE="${PHASE:-verify}"                 # 训练阶段："verify" / "exp" / "fu
 LORA_RANK="${LORA_RANK:-128}"            # LoRA 秩 r（StoryMem 同骨干先例 r128）
 LORA_ALPHA="${LORA_ALPHA:-128}"          # scaling=alpha/r；默认 alpha=r → scaling=1
 LORA_DROPOUT="${LORA_DROPOUT:-0.0}"      # LoRA dropout
-LORA_TARGETS="${LORA_TARGETS:-self_attn,ffn}"   # 挂载层组（self_attn/ffn/cross_attn/cam）
+LORA_TARGETS="${LORA_TARGETS:-self_attn,ffn,cross_attn}"   # 挂载层组（D-09': self_attn+ffn+cross_attn）
 NUM_ANCHOR_FRAMES="${NUM_ANCHOR_FRAMES:-1}"     # 拼接 anchor 帧数（token 预算）
 
 # ---- 训练超参（对齐 v5：1e-4 量级）----

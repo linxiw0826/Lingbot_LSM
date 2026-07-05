@@ -115,6 +115,10 @@ from pipeline.v6.latentconcat_ideal_diag import (  # noqa: E402
     _load_pipeline,
 )
 
+# covisibility：训练 D-09' anchor 挖掘用的共视打分。推理检索复用**同一把尺**做二次过滤/重排
+# （位置×yaw），使推理 anchor 选择与训练挖掘对齐（否则纯位置检索会注入同地点背对帧）。
+from pipeline.v6.covisibility import covisibility_score, DEFAULT_MIN_COVIS_SCORE  # noqa: E402
+
 # episode 加载 / 解码（与 infer_v5 / ideal_diag 同源）
 from pipeline.eval.retrieval_probe import (  # noqa: E402
     load_episode_clips,
@@ -184,6 +188,17 @@ def _parse_args():
     p.add_argument("--num_anchor_frames", type=int, default=1,
                    help="每 clip 注入的 anchor 帧数上限（取 retrieve_revisit top-N，默认 1；token "
                         "预算 R3：每 anchor 帧占完整 1560 token，少量为宜）。")
+    # covis 二次过滤：使推理 anchor 选择与训练 D-09' 共视挖掘对齐（bank 纯位置召回 → 用同一
+    # covisibility_score 按位置×yaw 过滤/重排，挡掉同地点背对帧）。默认开；--no_covis_filter 退回纯位置。
+    p.add_argument("--covis_filter", dest="covis_filter", action="store_true", default=True,
+                   help="（默认开）对 bank 位置召回的候选再用训练同一 covisibility_score（位置×yaw）"
+                        "过滤/重排，与 D-09' 挖掘对齐。")
+    p.add_argument("--no_covis_filter", dest="covis_filter", action="store_false",
+                   help="关闭 covis 过滤，退回纯位置 top-N 检索（A/B 用）。")
+    p.add_argument("--min_covis_score", type=float, default=DEFAULT_MIN_COVIS_SCORE,
+                   help=f"covis 过滤阈值（默认 {DEFAULT_MIN_COVIS_SCORE}，对齐训练 min_covis_score）。")
+    p.add_argument("--anchor_covis_use_fov", action="store_true", default=False,
+                   help="covis 打分启用 FOV 乘子（默认 False，对齐训练默认）。")
 
     # ---- 多 clip 自回归 ----
     p.add_argument("--num_clips", type=int, default=12,
@@ -295,18 +310,23 @@ def _retrieve_anchor(
     top_k: int,
     min_gap_frames: int,
     device: torch.device,
+    ref_c2w: Optional[np.ndarray] = None,
+    min_covis_score: float = 0.0,
+    covis_filter: bool = False,
+    use_fov: bool = False,
 ) -> Optional[Tuple[torch.Tensor, np.ndarray]]:
     """从 bank 检索历史帧 → 构造 anchor (latent [16,n,lat_h,lat_w], poses [n,4,4]) 或 None。
 
     复用 bank.retrieve_revisit（绝对位置键 + 排近期，[[F-14]]/OP-2）；检索结果 frames/latents 同序
-    （retrieve_by_location 升序 = 位置最近优先）。取 top num_anchor_frames：
-      - anchor_latent：latents[:n] 形状 [n,16,lat_h,lat_w] → permute 成 [16,n,lat_h,lat_w]
-        （_generate_with_anchor 的 anchor 时间维布局）。
-      - anchor_poses ：按 frames[i].timestep 从 timestep_to_pose 取回**完整 4×4** c2w（bank 只存
-        location[3]，plucker 需完整位姿）。某帧 timestep 不在映射里（理论不应发生）→ 跳过该帧。
+    （retrieve_by_location 升序 = 位置最近优先）。bank 只存 location[3]（纯位置召回），故当
+    covis_filter=True 时，对召回候选再用**训练同一 covisibility_score(ref_c2w, cand_c2w)**（位置×yaw，
+    可选 FOV）过滤/重排 —— 与 D-09' 挖掘对齐，挡掉同地点背对帧；关闭则退回纯位置 top-N。
+      - anchor_latent：选中帧 latent → stack 成 [16,n,lat_h,lat_w]（_generate_with_anchor 时间维布局）。
+      - anchor_poses ：按 frames[i].timestep 从 timestep_to_pose 取回**完整 4×4** c2w（plucker 需完整位姿）。
+        某帧 timestep 不在映射里（理论不应发生）→ 跳过该帧。
 
     Returns:
-        (anchor_latent, anchor_poses) 或 None（bank 空 / 检索空 / 无可用位姿）。
+        (anchor_latent, anchor_poses) 或 None（bank 空 / 检索空 / covis 过滤后无候选 / 无可用位姿）。
     """
     if bank.size() == 0:
         return None
@@ -321,20 +341,31 @@ def _retrieve_anchor(
     if not frames or latents is None:
         return None
 
-    n = min(max(1, int(num_anchor_frames)), len(frames))
-    lat_list: List[torch.Tensor] = []
-    pose_list: List[np.ndarray] = []
-    for i in range(n):
+    do_covis = bool(covis_filter) and ref_c2w is not None
+    # 候选收集：(rank, latent[16,h,w], pose[4,4])。covis 时 rank=共视分（降序=最共视优先，
+    # 低于阈值丢弃）；否则 rank=-i 保持位置召回顺序（i 越小越近）。
+    cands: List[Tuple[float, torch.Tensor, np.ndarray]] = []
+    for i in range(len(frames)):
         ts = int(frames[i].timestep)
         pose = timestep_to_pose.get(ts)
         if pose is None:
             logger.warning("retrieve: timestep=%d 无对应位姿（跳过该 anchor 帧）", ts)
             continue
-        lat_list.append(latents[i])          # [16, lat_h, lat_w]
-        pose_list.append(pose)               # [4, 4]
-    if not lat_list:
+        if do_covis:
+            cs = covisibility_score(ref_c2w, pose, use_fov=use_fov)
+            if cs < min_covis_score:
+                continue
+            rank = float(cs)
+        else:
+            rank = -float(i)
+        cands.append((rank, latents[i], pose))
+    if not cands:
         return None
 
+    cands.sort(key=lambda t: t[0], reverse=True)
+    n = min(max(1, int(num_anchor_frames)), len(cands))
+    lat_list = [cands[j][1] for j in range(n)]          # each [16, lat_h, lat_w]
+    pose_list = [cands[j][2] for j in range(n)]          # each [4, 4]
     anchor_latent = torch.stack(lat_list, dim=1).to(device).float()  # [16, n, lat_h, lat_w]
     anchor_poses = np.stack(pose_list, axis=0).astype(np.float32)    # [n, 4, 4]
     return anchor_latent, anchor_poses
@@ -473,7 +504,11 @@ def _rollout_long_video(wan_i2v, job, args, device, num_clips):
                 bank, timestep_to_pose, query_location, global_t,
                 num_anchor_frames=args.num_anchor_frames,
                 top_k=args.revisit_top_k, min_gap_frames=args.revisit_min_gap_frames,
-                device=device)
+                device=device,
+                ref_c2w=clip_poses[0],  # 当前 clip 首帧 c2w（共视参考，对齐训练 ref_c2w）
+                min_covis_score=args.min_covis_score,
+                covis_filter=args.covis_filter,
+                use_fov=args.anchor_covis_use_fov)
             if anchor is not None:
                 anchor_latent, anchor_poses = anchor
             _k = 0 if anchor_latent is None else anchor_latent.shape[1]
