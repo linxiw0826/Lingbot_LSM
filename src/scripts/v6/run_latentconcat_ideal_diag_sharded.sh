@@ -203,6 +203,11 @@ for i in $(seq 0 $((NUM_SHARDS - 1))); do
     shard_run_dir="${OUTPUT_ROOT}/v6/eval/${RUN_NAME}/${shard_tag}"
     SHARD_DIRS[$i]="${shard_run_dir}"
 
+    # per_window.csv 是追加写(抗崩)；同名 RUN_NAME/TAG 复用会把上一轮(可能异构 schema)
+    # 的旧行追加进来 → 锯齿 CSV，merge 解析崩。每轮启动前清掉旧的，杜绝跨轮污染。
+    mkdir -p "${shard_run_dir}"
+    rm -f "${shard_run_dir}/per_window.csv"
+
     SHARD_ARGS=(
         --ckpt_dir              "${CKPT_DIR}"
         --dataset_dir           "${DATASET_DIR}"
