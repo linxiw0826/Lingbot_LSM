@@ -108,11 +108,13 @@ from pipeline.v5.infer_v5 import (  # noqa: E402
 # stage1_upperbound：**已验证**帧维 anchor-concat 生成（[[F-23]] 12/12）
 from pipeline.eval.stage1_upperbound import _generate_with_anchor  # noqa: E402
 
-# latentconcat_ideal_diag：per-clip 数据 prompt + 模型装载（复用，确保与诊断同源；不改 ideal_diag）
+# latentconcat_ideal_diag：per-clip 数据 prompt（复用，确保与诊断同源；不改 ideal_diag）。
+# 注意：模型装载**不**复用 ideal_diag._load_pipeline —— 那个会做 memory 转换（每 block 包成
+# MemoryBlockWrapper，真 self_attn 落到 blocks.N.block.*），会让训练 LoRA 的 key（blocks.N.self_attn.*）
+# 对不上。v6 infer 用本文件 _load_raw_pipeline 走**裸骨干**（见其 docstring）。
 from pipeline.v6.latentconcat_ideal_diag import (  # noqa: E402
     _clip_prompt,
     _clip_args,
-    _load_pipeline,
 )
 
 # covisibility：训练 D-09' anchor 挖掘用的共视打分。推理检索复用**同一把尺**做二次过滤/重排
@@ -161,6 +163,18 @@ def _parse_args():
                    help="（可选）v4 low_noise_model checkpoint 目录（仅影响 DiT 主干）")
     p.add_argument("--ft_high_model_dir", type=str, default=None,
                    help="（可选）dual 训练 high_noise_model 目录")
+
+    # ---- 训练出来的 LoRA（挂到冻结 low_noise_model 主干；不给 = 跑 base）----
+    p.add_argument("--lora_path", type=str, default=None,
+                   help="v6 训练 LoRA checkpoint：可为 tag 目录（含 lora.pth + training_metadata.json）"
+                        "或直接 lora.pth。挂到 low_noise_model + load（train_v6 同一 attach）。"
+                        "不给 → 跑 base（无 LoRA）。")
+    p.add_argument("--lora_rank", type=int, default=0,
+                   help="LoRA rank；0=读 training_metadata.json（对齐训练，推荐）。")
+    p.add_argument("--lora_alpha", type=float, default=0.0,
+                   help="LoRA alpha；0=读 training_metadata.json。")
+    p.add_argument("--lora_targets", type=str, default="",
+                   help="LoRA 挂载层组（逗号分隔）；空=读 training_metadata.json（对齐训练）。")
 
     # ---- 数据（二选一：action_path 模式 / episode 模式，镜像 infer_v5）----
     p.add_argument("--image", type=str, default=None,
@@ -623,6 +637,100 @@ def _score_job(job, clip_videos, args, device, out_dir, min_time_gap_frames):
 
 
 # ---------------------------------------------------------------------------
+# 模型装载（裸 WanI2V，不做 memory 转换）+ 训练 LoRA 加载
+# ---------------------------------------------------------------------------
+
+def _load_raw_pipeline(args, device):
+    """v6 infer 用**裸 WanI2V**（不做 memory 转换）。
+
+    理由：① v6 全程不用 model 层 in-context memory（[[F-30]] 判死），anchor 走原生 i2v 条件路径
+    （`_generate_with_anchor`，memory_states 全程 None）；② 裸骨干 `blocks.N.self_attn...` 的 key
+    与训练 LoRA 一致 —— ideal_diag 的 memory 转换会把每 block 包成 `blocks.N.block.*`，LoRA key
+    对不上（ReviewAgent 查实）。`MemoryBlockWrapper` 无 memory_states 时纯直通 self.block → 裸骨干
+    生成与 memory-converted 的 ideal_diag（已 GO）**数值一致**，故切裸不改结论。
+
+    i2v-A14B 双专家：LoRA 只挂 low_noise_model（训练只训它，high 跑 base，对齐 v4 TRAIN_HIGH=0）。
+    """
+    from wan.image2video import WanI2V
+    from wan.configs import WAN_CONFIGS
+
+    if args.ft_model_dir or args.ft_high_model_dir:
+        raise SystemExit(
+            "v6 infer 裸 loader 暂不支持 --ft_model_dir/--ft_high_model_dir（那是全参微调路径）；"
+            "训练出来的 LoRA 权重请用 --lora_path。")
+
+    cfg = WAN_CONFIGS["i2v-A14B"]
+    local_rank = device.index if device.type == "cuda" and device.index is not None else 0
+    wan_i2v = WanI2V(
+        config=cfg, checkpoint_dir=args.ckpt_dir, device_id=local_rank, rank=0,
+        t5_fsdp=False, dit_fsdp=False, use_sp=False,
+    )
+    logger.info("裸 WanI2V 加载完成（无 memory 转换，v6 anchor-concat 走原生 i2v 条件路径）。")
+    return wan_i2v
+
+
+def _load_lora_into_backbone(wan_i2v, lora_path: str, args, device) -> None:
+    """给冻结 DiT 主干（low_noise_model，训练只训它）挂 LoRA 并加载 `lora.pth` 权重。
+
+    加载配方与 train_v6 docstring 一致：重建 base（_load_raw_pipeline 已建）→ attach_lora_to_backbone
+    → load_state_dict(strict=False)。LoRA 重建配置（rank/alpha/dropout/targets）优先读同目录
+    training_metadata.json（保证与训练完全一致），CLI 非默认值则覆盖。
+
+    lora_path：① tag 目录（含 lora.pth + training_metadata.json）或 ② 直接 lora.pth 文件。
+
+    **失败即响**：若保存的 LoRA key 与挂载后主干不匹配（rank/targets 不一致，或主干 key 前缀不同）
+    → load 后 unexpected≠0 / lora key 落 missing / matched=0 → 直接 SystemExit（绝不静默跑 base）。
+    """
+    import json
+    from pipeline.v6.train_v6 import attach_lora_to_backbone
+
+    if os.path.isdir(lora_path):
+        pth = os.path.join(lora_path, "lora.pth")
+        meta_path = os.path.join(lora_path, "training_metadata.json")
+    else:
+        pth = lora_path
+        meta_path = os.path.join(os.path.dirname(lora_path), "training_metadata.json")
+    if not os.path.isfile(pth):
+        raise SystemExit(f"--lora_path: 找不到 lora.pth（{pth}）")
+
+    meta: Dict = {}
+    if os.path.isfile(meta_path):
+        try:
+            with open(meta_path) as f:
+                meta = json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            raise SystemExit(f"--lora_path: training_metadata.json 读取失败（{meta_path}）: {exc}")
+
+    rank = args.lora_rank if args.lora_rank else int(meta.get("lora_rank") or 128)
+    alpha = args.lora_alpha if args.lora_alpha else float(meta.get("lora_alpha") or rank)
+    dropout = float(meta.get("lora_dropout") or 0.0)
+    targets_str = args.lora_targets or meta.get("lora_targets") or "self_attn,ffn,cross_attn"
+    targets = [t.strip() for t in targets_str.split(",") if t.strip()]
+
+    dit = wan_i2v.low_noise_model
+    dit.requires_grad_(False)
+    n_wrapped, n_params = attach_lora_to_backbone(dit, rank, alpha, dropout, targets)
+    logger.info("infer LoRA: attach 到 low_noise_model %d 层（rank=%d alpha=%s targets=%s，%d 参数）",
+                n_wrapped, rank, alpha, targets, n_params)
+
+    sd = torch.load(pth, map_location=device)
+    if not sd:
+        raise SystemExit(f"--lora_path: lora.pth 为空（{pth}）")
+    missing, unexpected = dit.load_state_dict(sd, strict=False)
+    lora_missing = [k for k in missing if ".lora_" in k]
+    matched = len(sd) - len(unexpected)
+    if unexpected or lora_missing or matched == 0:
+        raise SystemExit(
+            f"--lora_path: LoRA 权重与主干不匹配（matched={matched}/{len(sd)} "
+            f"unexpected={len(unexpected)} lora_missing={len(lora_missing)}）——"
+            f"检查 --lora_rank/--lora_targets 是否与训练一致。"
+            f"样例 unexpected={unexpected[:3]} lora_missing={lora_missing[:3]}")
+    dit.eval()
+    logger.info("infer LoRA: 已加载 %d 个 LoRA 张量（epoch=%s step=%s），unexpected=0 匹配干净。",
+                matched, meta.get("epoch"), meta.get("global_step"))
+
+
+# ---------------------------------------------------------------------------
 # 主入口
 # ---------------------------------------------------------------------------
 
@@ -679,8 +787,13 @@ def main():
             logger.info("action_path 模式单轨迹：shard %d 非 0，跳过。", args.shard_index)
             return
 
-    # ---- 加载 pipeline（复用 ideal_diag._load_pipeline；冻结 DiT，memory 不参与）----
-    wan_i2v = _load_pipeline(args, device)
+    # ---- 加载 pipeline（裸 WanI2V，无 memory 转换 → LoRA key 与训练对齐）----
+    wan_i2v = _load_raw_pipeline(args, device)
+    # ---- 挂训练 LoRA（不给 --lora_path → 跑 base，无 LoRA）----
+    if args.lora_path:
+        _load_lora_into_backbone(wan_i2v, args.lora_path, args, device)
+    else:
+        logger.info("未给 --lora_path → 跑 base 主干（无 LoRA）。")
 
     # ---- 逐 job rollout + 保存长视频 ----
     if episode_mode:
