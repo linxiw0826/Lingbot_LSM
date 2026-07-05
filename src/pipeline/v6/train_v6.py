@@ -111,6 +111,15 @@ from pipeline.eval.stage1_upperbound import (  # noqa: E402
     _encode_anchor_latent,
     _build_conditioning_with_anchor,
 )
+# ---- 共视 anchor 挖掘（decisions.md 讨论 13 / D-09'，[[F-33]]）----
+from pipeline.v6.covisibility import (  # noqa: E402
+    select_covisible_anchor_frames,
+    DEFAULT_MIN_COVIS_SCORE,
+)
+
+# anchor 共视挖掘时排除**紧邻 query** 的帧数（最后一个 context clip 末尾的平凡续帧，
+# 不算「记忆」）。小值即可：context clips 整段早于 query，只需剔掉时间上贴着 query 的尾巴。
+_ANCHOR_EXCLUDE_ADJACENT_FRAMES = 4
 
 logging.basicConfig(
     format='%(asctime)s | %(levelname)s | %(name)s | %(message)s',
@@ -399,17 +408,72 @@ class LingBotTrainerV6(LingBotMemoryTrainerV5):
 # anchor 自监督选取 + 单步 forward（frame-dim anchor-concat）
 # ============================================================
 
+def _random_anchor_picks(
+    context_clips: List[dict], num_anchor_frames: int, rng,
+) -> List[Tuple[int, int]]:
+    """旧式随机 anchor 选取（random clip + random frame），但用**传入 rng**（不碰全局 random）。
+    只用 rng.random()（random.Random 与 np.random.Generator 都支持）→ 确定性。
+    用于 dropout「wrong anchor」臂 + probe/diag 兜底（保证选出 anchor）。"""
+    n_clips = len(context_clips)
+    picks: List[Tuple[int, int]] = []
+    for _ in range(num_anchor_frames):
+        ci = min(n_clips - 1, int(rng.random() * n_clips))
+        n_frames = context_clips[ci]["video"].squeeze(0).shape[1]
+        fi = min(n_frames - 1, int(rng.random() * n_frames))
+        picks.append((ci, fi))
+    return picks
+
+
+def _encode_anchor_picks(
+    trainer: LingBotTrainerV6,
+    context_clips: List[dict],
+    picks: List[Tuple[int, int]],
+    args,
+    device: torch.device,
+) -> Tuple[torch.Tensor, np.ndarray]:
+    """把 (clip_idx, frame_idx) 列表 VAE 编码成 clean anchor latent + 取绝对 c2w 位姿。
+    编码口径与旧 _select_anchor 完全一致（复用 stage1 _encode_anchor_latent，no_grad）。"""
+    h, w = args.height, args.width
+    latents: List[torch.Tensor] = []
+    poses_np: List[np.ndarray] = []
+    for ci, fi in picks:
+        clip = context_clips[ci]
+        video = clip["video"].squeeze(0)          # [3, F, H, W] in [-1,1]
+        poses = clip["poses"].squeeze(0)          # [F, 4, 4]
+        anchor_chw = video[:, fi].detach().cpu().numpy()   # [3, H, W] in [-1,1]
+        anchor_lat = _encode_anchor_latent(trainer.vae, anchor_chw, h, w, device)  # [16,1,lat_h,lat_w]
+        latents.append(anchor_lat)
+        poses_np.append(poses[fi].detach().cpu().numpy().astype(np.float32))  # [4,4]
+    anchor_latent = torch.cat(latents, dim=1)             # [16, n_anchor, lat_h, lat_w]
+    anchor_poses = np.stack(poses_np, axis=0)             # [n_anchor, 4, 4]
+    return anchor_latent, anchor_poses
+
+
 def _select_anchor(
     trainer: LingBotTrainerV6,
     context_clips: List[dict],
+    ref_c2w,
     args,
     device: torch.device,
+    rng,
+    *,
+    apply_dropout: bool = True,
 ) -> Tuple[Optional[torch.Tensor], Optional[np.ndarray]]:
-    """自监督 anchor 选取：从 target clip 之前的 context clips 里随机取 num_anchor_frames 个
-    较早帧，VAE encode（no_grad）作 clean anchor latent + 取其绝对 c2w 位姿。
+    """共视（co-visible）anchor 选取 + dropout 混合（D-09'，decisions.md 讨论 13 / [[F-33]]）。
 
-    StoryMem 式自监督（不依赖真重访对，避开 D-07 revisit 稀疏）：context clips 整段早于
-    query clip → 天然满足「较早帧 + 跨 clip 时间间隔」。
+    以 query 参考位姿 `ref_c2w`（= target/query clip 第 0 帧绝对 c2w）为锚，从 target clip 之前
+    的 context clips 里挑一个**共视**（同地点、视野重叠）的较早帧作 anchor，VAE encode（no_grad）
+    成 clean anchor latent + 取其**精确**绝对 c2w 位姿（不扰动，供 plücker）。
+
+    dropout 混合（`apply_dropout=True`，训练用；用传入 rng，确定性，不碰全局 random）：
+      - r < p_empty                → (None, None)（OFF 臂，纯 i2v）
+      - r < p_empty + p_wrong      → **wrong anchor**（旧式 random clip+frame；loss 仍在正确
+                                     query 上 → 教模型「忽略无关记忆」）
+      - else                       → **co-visible anchor**（select_covisible_anchor_frames）；
+                                     无共视候选（返回 []）→ 回退 (None, None)（空）
+
+    `apply_dropout=False`（probe / 每-epoch 诊断用）：跳过 dropout，直接共视选取；共视为空则
+    回退旧式 random（保证选出 anchor，供 ON/OFF 探针度量），使固定探针 batch 跨 epoch 可比。
 
     Returns:
         (anchor_latent [16, n_anchor, lat_h, lat_w] 或 None,
@@ -419,24 +483,31 @@ def _select_anchor(
     if not context_clips or args.num_anchor_frames <= 0:
         return None, None
 
-    h, w = args.height, args.width
-    latents: List[torch.Tensor] = []
-    poses_np: List[np.ndarray] = []
-    for _ in range(args.num_anchor_frames):
-        clip = random.choice(context_clips)
-        video = clip["video"].squeeze(0)          # [3, F, H, W] in [-1,1]
-        poses = clip["poses"].squeeze(0)          # [F, 4, 4]
-        n_frames = video.shape[1]
-        fi = random.randint(0, n_frames - 1)
-        anchor_chw = video[:, fi].detach().cpu().numpy()   # [3, H, W] in [-1,1]
-        # 复用 stage1 已验证的单帧 anchor VAE 编码（no_grad；anchor 为 clean 上下文）
-        anchor_lat = _encode_anchor_latent(trainer.vae, anchor_chw, h, w, device)  # [16,1,lat_h,lat_w]
-        latents.append(anchor_lat)
-        poses_np.append(poses[fi].detach().cpu().numpy().astype(np.float32))  # [4,4]
+    mode = "covis"
+    if apply_dropout:
+        r = rng.random()
+        if r < args.anchor_dropout_empty:
+            return None, None                                        # OFF 臂（纯 i2v）
+        elif r < args.anchor_dropout_empty + args.anchor_dropout_wrong:
+            mode = "wrong"                                           # wrong anchor（教忽略）
 
-    anchor_latent = torch.cat(latents, dim=1)             # [16, n_anchor, lat_h, lat_w]
-    anchor_poses = np.stack(poses_np, axis=0)             # [n_anchor, 4, 4]
-    return anchor_latent, anchor_poses
+    if mode == "covis":
+        picks = select_covisible_anchor_frames(
+            context_clips, ref_c2w,
+            num_frames=args.num_anchor_frames,
+            min_score=args.min_covis_score,
+            rng=rng,
+            use_fov=args.anchor_covis_use_fov,
+            exclude_adjacent_frames=_ANCHOR_EXCLUDE_ADJACENT_FRAMES,
+        )
+        if not picks:
+            if apply_dropout:
+                return None, None                                    # 训练：无共视 → 回退空
+            picks = _random_anchor_picks(context_clips, args.num_anchor_frames, rng)  # probe/diag 兜底
+    else:  # mode == "wrong"
+        picks = _random_anchor_picks(context_clips, args.num_anchor_frames, rng)
+
+    return _encode_anchor_picks(trainer, context_clips, picks, args, device)
 
 
 def _forward_with_optional_anchor(
@@ -445,10 +516,15 @@ def _forward_with_optional_anchor(
     ctx: dict,
     anchor_latent: Optional[torch.Tensor],
     anchor_poses_np: Optional[np.ndarray],
+    rng=None,
 ) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
     """组装 frame-dim anchor-concat 输入并跑一次骨干 forward（梯度走 LoRA）。
 
     anchor_latent / anchor_poses_np 同时为 None → off 臂（纯 query i2v，无 anchor）。
+
+    `rng` 非 None（仅训练传入）→ 给 **y-path**（模型 READS 的条件）anchor cond-latent 注入 FM
+    噪声（曝光偏差鲁棒性），x-path/target/query/plücker/pose 一律不动。rng=None（probe/diag 度量
+    路径）→ sigma_mem=0，anchor y-path 为 clean，度量确定、可比。
 
     Returns:
         (pred [16, lat_f_total, lat_h, lat_w], target_full [同 shape],
@@ -489,7 +565,19 @@ def _forward_with_optional_anchor(
         msk_anchor = torch.ones(4, n_anchor, lat_h, lat_w,
                                 device=device, dtype=y_query.dtype)
         msk = torch.cat([msk_q, msk_anchor], dim=1)            # [4, lat_f_total]
-        cond_latent = torch.cat([ylat_q, anchor_clean.to(y_query.dtype)], dim=1)  # [16, lat_f_total]
+        # ---- 曝光偏差鲁棒性：仅给 **y-path**（模型 READS 的 anchor 条件）注入 FM 噪声 ----
+        # sigma_mem：~0.5 概率 0（clean），否则 U(0, mem_noise_max)。sigma_mem **值**用传入 rng
+        # 采样（per-forward，确定性，不碰全局 random）；噪声张量用 randn_like（torch 全局 RNG，
+        # 与 query_noise 同源）。x-path full_clean / target / query / anchor plücker/pose 全不动。
+        anchor_y = anchor_clean
+        if rng is not None:
+            mem_noise_max = float(getattr(trainer.args, "mem_noise_max", 0.0))
+            if mem_noise_max > 0.0 and rng.random() >= 0.5:
+                sigma_mem = float(rng.random()) * mem_noise_max
+                anchor_y = ((1.0 - sigma_mem) * anchor_clean
+                            + sigma_mem * torch.randn_like(anchor_clean))
+                logger.debug("mem-noise: sigma_mem=%.4f (max=%.3f)", sigma_mem, mem_noise_max)
+        cond_latent = torch.cat([ylat_q, anchor_y.to(y_query.dtype)], dim=1)  # [16, lat_f_total]
         y_full = torch.cat([msk, cond_latent], dim=0)          # [20, lat_f_total]
     else:
         y_full = y_query
@@ -580,16 +668,22 @@ def multi_clip_training_step_v6(
     batch_clips: List[dict],
     args,
     n_ctx: int,
+    rng,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """v6 单步训练：自监督 anchor frame-dim concat + 单步 FM 重建（只在 query 帧算 loss）。"""
+    """v6 单步训练：共视 anchor frame-dim concat + 单步 FM 重建（只在 query 帧算 loss）。
+
+    `rng` = 传入的确定性 rng（不碰全局 random），同时驱动 anchor dropout 混合选取与 y-path
+    mem-noise 采样。query 参考位姿 = target clip 第 0 帧绝对 c2w（供共视挖掘打分）。"""
     context_clips = batch_clips[:n_ctx]
     target_clip = batch_clips[n_ctx]
 
-    anchor_latent, anchor_poses_np = _select_anchor(trainer, context_clips, args, trainer.device)
+    ref_c2w = target_clip["poses"].squeeze(0)[0]   # query 参考位姿 = target clip frame-0 绝对 c2w
+    anchor_latent, anchor_poses_np = _select_anchor(
+        trainer, context_clips, ref_c2w, args, trainer.device, rng)
     ctx = _build_target_ctx(trainer, model, target_clip)
 
     pred, target_full, lat_f_query, lat_f_total = _forward_with_optional_anchor(
-        trainer, model, ctx, anchor_latent, anchor_poses_np
+        trainer, model, ctx, anchor_latent, anchor_poses_np, rng=rng
     )
 
     # loss mask：排除 query 首帧（i2v image 条件）+ 排除 anchor 尾部帧（clean 上下文，不进 loss）
@@ -804,8 +898,11 @@ def run_epoch_diagnostics(
             n_ctx = max(1, len(diag_batch) - 1)
             context_clips = diag_batch[:n_ctx]
             target_clip = diag_batch[n_ctx]
+            ref_c2w = target_clip["poses"].squeeze(0)[0]  # query 参考位姿（frame-0 绝对 c2w）
+            # 固定 seed rng + apply_dropout=False → 跨 epoch 选同一共视 anchor，ON/OFF diff 可比
             anchor_latent, anchor_poses_np = _select_anchor(
-                trainer, context_clips, args, trainer.device)
+                trainer, context_clips, ref_c2w, args, trainer.device,
+                random.Random(0), apply_dropout=False)
             if anchor_latent is not None:
                 ctx = _build_target_ctx(trainer, unwrapped, target_clip)
             else:
@@ -887,7 +984,11 @@ def run_r6_probes_v6(
     context_clips = batch_clips[:n_ctx]
     target_clip = batch_clips[n_ctx]
 
-    anchor_latent, anchor_poses_np = _select_anchor(trainer, context_clips, args, device)
+    ref_c2w = target_clip["poses"].squeeze(0)[0]  # query 参考位姿（frame-0 绝对 c2w）
+    # apply_dropout=False → 强制选出 anchor（共视优先，空则旧式 random 兜底），供探针度量
+    anchor_latent, anchor_poses_np = _select_anchor(
+        trainer, context_clips, ref_c2w, args, device,
+        random.Random(0), apply_dropout=False)
     if anchor_latent is None:
         raise RuntimeError(
             "R6 探针：未能选出 anchor（context_clips 为空或 num_anchor_frames<=0）。"
@@ -1022,13 +1123,28 @@ def parse_args() -> argparse.Namespace:
                         help="LoRA scaling alpha（scaling=alpha/r；默认 alpha=r=128 → scaling=1）")
     parser.add_argument("--lora_dropout", type=float, default=0.0,
                         help="LoRA dropout（默认 0）")
-    parser.add_argument("--lora_targets", type=str, default="self_attn,ffn",
+    parser.add_argument("--lora_targets", type=str, default="self_attn,ffn,cross_attn",
                         help="LoRA 挂载层组，逗号分隔，可选 self_attn/ffn/cross_attn/cam；"
-                             "默认 'self_attn,ffn'（anchor 经 self-attn 与 query 交互最相关 + ffn 适配）")
+                             "默认 'self_attn,ffn,cross_attn'（StoryMem r128 存在性证明覆盖全线性层含"
+                             " cross_attn；anchor 经 self-attn 与 query 交互 + ffn/cross_attn 适配）")
 
-    # ---- anchor 自监督选取 ----
+    # ---- anchor 共视选取 + dropout 混合（D-09'，decisions.md 讨论 13 / [[F-33]]）----
     parser.add_argument("--num_anchor_frames", type=int, default=1,
                         help="拼接的 anchor 帧数（token 预算 R3：每帧占整段 token，默认 1）")
+    parser.add_argument("--anchor_dropout_empty", type=float, default=0.12,
+                        help="dropout 混合：以此概率返回空 anchor（OFF 臂，纯 i2v）")
+    parser.add_argument("--anchor_dropout_wrong", type=float, default=0.08,
+                        help="dropout 混合：以此概率用 wrong anchor（旧式 random clip+frame），"
+                             "loss 仍在正确 query 上 → 教模型忽略无关记忆")
+    parser.add_argument("--min_covis_score", type=float, default=DEFAULT_MIN_COVIS_SCORE,
+                        help="共视 anchor 最低分（低于此的候选帧不参与加权采样；首猜须标定）")
+    parser.add_argument("--anchor_covis_use_fov", action="store_true", default=False,
+                        help="共视打分叠加 FOV 视锥重叠精修（需 clip['intrinsics']；默认关）")
+
+    # ---- 记忆 y-path 曝光偏差鲁棒性 ----
+    parser.add_argument("--mem_noise_max", type=float, default=0.10,
+                        help="y-path anchor cond-latent FM 噪声上限：sigma_mem ~0.5 概率 0，"
+                             "否则 U(0, mem_noise_max)（仅腐蚀模型读侧 y，不动 x-path/loss/query）")
 
     # ---- 训练超参（对齐 v5）----
     parser.add_argument("--height", type=int, default=480)
@@ -1254,12 +1370,16 @@ def main():
                     "diffusion": 0.0, "n_anchor": 0.0, "lat_f_query": 0.0
                 }
                 try:
+                    # 确定性 anchor rng（不碰全局 random）：seed = global_step + rank，
+                    # 各 rank 独立、可复现（驱动 anchor dropout 混合选取 + y-path mem-noise）。
+                    _anchor_rng = random.Random(global_step * 100003 + accelerator.process_index)
                     loss, _loss_components = multi_clip_training_step_v6(
                         trainer,
                         accelerator.unwrap_model(model),
                         batch_clips,
                         args,
                         n_ctx=_synced_n_ctx,
+                        rng=_anchor_rng,
                     )
                 except torch.cuda.OutOfMemoryError:
                     try:
