@@ -55,6 +55,7 @@ RUN_NAME="${RUN_NAME:-}"                 # 空 → train_v6 用 default_run_name
 RESUME_FROM="${RESUME_FROM:-}"           # 空=fresh（默认）；非空=从该 epoch 目录续训
 SAVE_STEPS="${SAVE_STEPS:-}"             # 非空=每 N 步额外存 step_<N> checkpoint（训练中途保险，防丢整 epoch）
 DRY_RUN="${DRY_RUN:-0}"                  # 1=保存冒烟：跑 2 步→诊断→存 epoch_1→退出（~15min 验证 save_lora 不崩）
+MAX_WINDOWS="${MAX_WINDOWS:-}"           # 仅测试：非空=数据集截断到 N 窗口（epoch 变短）。配 NUM_EPOCHS=2 验证「存→继续到下个 epoch」
 
 # 默认 0-5 共 6 卡（ZeRO-3 需 6 卡分摊 22.7B；项目记忆：4 卡会 OOM/死锁）。
 TRAIN_GPUS="${TRAIN_GPUS:-0,1,2,3,4,5}"
@@ -137,6 +138,10 @@ fi
 # 保存冒烟：跑 2 步 + 诊断 + 存 epoch_1 后退出
 if [ "${DRY_RUN}" = "1" ]; then
     TRAIN_ARGS+=(--dry_run)
+fi
+# 仅测试：截断数据集到 N 窗口（缩短 epoch，验证「存→继续」）
+if [ -n "${MAX_WINDOWS}" ]; then
+    TRAIN_ARGS+=(--max_windows "${MAX_WINDOWS}")
 fi
 
 echo "====================================================="

@@ -1192,6 +1192,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save_steps", type=int, default=None,
                         help="每 N steps 保存一次（None = 只按 epoch 保存）")
     parser.add_argument("--dataset_repeat", type=int, default=1)
+    parser.add_argument("--max_windows", type=int, default=0,
+                        help="仅测试用：>0 时把数据集截断到前 N 个窗口（Subset），让 epoch 变短，"
+                             "用于快速验证「存 checkpoint → 继续训练到下个 epoch」。0=不限（默认，正式训练用）。")
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--gradient_checkpointing", action="store_true", default=True)
     parser.add_argument("--num_workers", type=int, default=4)
@@ -1305,6 +1308,12 @@ def main():
         width=args.width,
         repeat=args.dataset_repeat,
     )
+    if args.max_windows and args.max_windows > 0:
+        from torch.utils.data import Subset
+        _n = min(int(args.max_windows), len(dataset))
+        dataset = Subset(dataset, list(range(_n)))
+        logging.info("--max_windows=%d → 数据集截断到 %d 窗口（仅测试：快速走到 epoch 边界验证 存→继续）",
+                     args.max_windows, _n)
     dataloader = DataLoader(
         dataset,
         batch_size=1,
