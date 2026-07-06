@@ -723,17 +723,25 @@ def save_lora(accelerator, model, run_dir, tag: str,
 
     gc.collect()
     torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()          # 排空上一步（run_epoch_diagnostics gather）的在途集合通信
     accelerator.wait_for_everyone()
 
     unwrapped = accelerator.unwrap_model(model)
     trainable = [(n, p) for n, p in unwrapped.named_parameters() if p.requires_grad]
 
-    state = None
+    # ZeRO-3 下**逐参数** gather（不一次性 gather 全部 800 个）：bulk GatheredParameters 在
+    # __exit__ 分区大量参数时会与紧邻的上一次 gather（run_epoch_diagnostics 的
+    # _measure_lora_norms）的 in-flight all-gather 竞争 → "Cannot partition a param in flight"
+    # 崩（空分片 tensor([])）。逐参数 gather 串行化每次集合通信，规避竞争；GatheredParameters 是
+    # 集合通信，所有 rank 必须同步进入每个 with（故循环遍历同一顺序的 trainable，不按 rank 分支）。
+    state = {} if accelerator.is_main_process else None
     try:
         import deepspeed
-        with deepspeed.zero.GatheredParameters([p for _, p in trainable], modifier_rank=0):
-            if accelerator.is_main_process:
-                state = {n: p.data.detach().cpu().clone() for n, p in trainable}
+        for n, p in trainable:
+            with deepspeed.zero.GatheredParameters([p], modifier_rank=0):
+                if accelerator.is_main_process:
+                    state[n] = p.data.detach().cpu().clone()
     except (ImportError, AttributeError):
         if accelerator.is_main_process:
             state = {n: p.data.detach().cpu().clone() for n, p in trainable}
@@ -809,11 +817,22 @@ def _measure_lora_norms(model: nn.Module, accelerator) -> Dict[str, float]:
             total_sq += float(d.detach().float().norm().item()) ** 2
         return total_sq ** 0.5
 
+    # 逐参数 gather（同 save_lora）：规避 bulk GatheredParameters 的 in-flight 分区竞争。
     try:
         import deepspeed
-        with deepspeed.zero.GatheredParameters([p for _, p in lora_named], modifier_rank=0):
-            a_norm = _agg_norm(a_named)
-            b_norm = _agg_norm(b_named)
+        a_sq = 0.0
+        b_sq = 0.0
+        for n, p in lora_named:
+            with deepspeed.zero.GatheredParameters([p], modifier_rank=0):
+                d = p.data
+                if d is not None and d.numel() > 0:
+                    v = float(d.detach().float().norm().item()) ** 2
+                    if ".lora_A." in n:
+                        a_sq += v
+                    else:
+                        b_sq += v
+        a_norm = a_sq ** 0.5
+        b_norm = b_sq ** 0.5
     except (ImportError, AttributeError):
         a_norm = _agg_norm(a_named)
         b_norm = _agg_norm(b_named)
