@@ -705,6 +705,36 @@ def multi_clip_training_step_v6(
 # Checkpoint：只存 LoRA 可训练权重
 # ============================================================
 
+def _full_param_reader():
+    """返回 (reader_fn, name)：ZeRO-3 下安全读**完整参数**的官方 API。
+
+    与 R6 PROBE B 的 `safe_get_full_grad` 同源（`deepspeed.utils.safe_get_full_*`）。它从优化器的
+    fp32 master 分片重建完整参数，**不经过 `GatheredParameters` 的 gather→partition→free 生命周期**
+    —— 因此规避两类崩：`Cannot partition a param in flight`（bulk gather 竞争）与
+    `Cannot free a ZeRO-3 parameter while it is still active in submodules`（诊断 forward 后参数仍被
+    子模块占用，free 失败）。集合通信：所有 rank 须对每个参数同序调用（reader 内部 all-gather）。
+
+    不可用（无 deepspeed / 非 ZeRO-3）→ (None, ...)，调用方回退 p.data（此时参数本就完整）。
+    """
+    try:
+        from deepspeed.utils import safe_get_full_fp32_param as _f
+        return _f, "deepspeed.safe_get_full_fp32_param"
+    except Exception:
+        return None, "p.data (deepspeed 参数 API 不可用)"
+
+
+def _read_full_param(p, reader):
+    """用 reader（safe_get_full_fp32_param）读完整参数；失败/不可用回退 p.data。所有 rank 同序调用。"""
+    if reader is not None:
+        try:
+            fp = reader(p)
+            if fp is not None:
+                return fp
+        except Exception:
+            pass
+    return p.data
+
+
 def save_lora(accelerator, model, run_dir, tag: str,
               epoch: int = 0, global_step: int = 0,
               lora_rank: Optional[int] = None,
@@ -714,7 +744,8 @@ def save_lora(accelerator, model, run_dir, tag: str,
     """只保存 LoRA 可训练权重（骨干冻结，eval 复用 base ckpt 重建后挂 LoRA + load）。
 
     保存到 run_dir/checkpoints/<tag>/lora.pth（dict: name -> cpu tensor），name 形如
-    'blocks.0.self_attn.q.lora_A.weight'。ZeRO-3 下用 GatheredParameters 聚合分片。
+    'blocks.0.self_attn.q.lora_A.weight'。ZeRO-3 下用 safe_get_full_fp32_param 逐参数读完整权重
+    （不用 GatheredParameters，规避 partition/free 生命周期崩），存为 bf16。
     同目录 training_metadata.json 存 epoch/global_step + LoRA 重建配置（eval 以此为准）。
     """
     save_dir = os.path.join(str(run_dir), "checkpoints", tag)
@@ -730,21 +761,18 @@ def save_lora(accelerator, model, run_dir, tag: str,
     unwrapped = accelerator.unwrap_model(model)
     trainable = [(n, p) for n, p in unwrapped.named_parameters() if p.requires_grad]
 
-    # ZeRO-3 下**逐参数** gather（不一次性 gather 全部 800 个）：bulk GatheredParameters 在
-    # __exit__ 分区大量参数时会与紧邻的上一次 gather（run_epoch_diagnostics 的
-    # _measure_lora_norms）的 in-flight all-gather 竞争 → "Cannot partition a param in flight"
-    # 崩（空分片 tensor([])）。逐参数 gather 串行化每次集合通信，规避竞争；GatheredParameters 是
-    # 集合通信，所有 rank 必须同步进入每个 with（故循环遍历同一顺序的 trainable，不按 rank 分支）。
+    # ZeRO-3 下用 safe_get_full_fp32_param 逐参数读完整权重（**不用 GatheredParameters**）：后者的
+    # gather→partition→free 生命周期在诊断 forward 之后会崩（param 仍 active in submodules）。
+    # safe_get 读优化器 fp32 master、绕开模块参数状态。所有 rank 同序对每个参数调用（内部 all-gather）；
+    # is_main 仅 guard 复制。存为 bf16（与训练 dtype 一致，省盘；fp32 master → bf16 无损训练精度语义）。
+    reader, reader_name = _full_param_reader()
     state = {} if accelerator.is_main_process else None
-    try:
-        import deepspeed
-        for n, p in trainable:
-            with deepspeed.zero.GatheredParameters([p], modifier_rank=0):
-                if accelerator.is_main_process:
-                    state[n] = p.data.detach().cpu().clone()
-    except (ImportError, AttributeError):
-        if accelerator.is_main_process:
-            state = {n: p.data.detach().cpu().clone() for n, p in trainable}
+    for n, p in trainable:
+        full = _read_full_param(p, reader)
+        if accelerator.is_main_process and full is not None:
+            state[n] = full.detach().to(torch.bfloat16).cpu().clone()
+    if accelerator.is_main_process and reader is None:
+        logging.warning("save_lora: %s → 回退 p.data（ZeRO-3 分片下可能存到不完整权重！）", reader_name)
 
     if accelerator.is_main_process:
         bad = [n for n in state if ".lora_" not in n]
@@ -797,10 +825,10 @@ def _measure_lora_norms(model: nn.Module, accelerator) -> Dict[str, float]:
     B 零初始化 → ‖B‖ 长期≈0 表示 LoRA 没学到东西（等价没训）；‖A‖ 反映 A 的漂移。
 
     **ZeRO-3 正确聚合**：分片模式下 p.data 只是本 rank 的分片（partition），直接算范数会得到
-    size-0 的假 0 / 偏小值。故用 `deepspeed.zero.GatheredParameters` 在 with 块内把各 LoRA
-    参数聚合成完整张量后再算范数（与 save_lora 同一思路）。GatheredParameters 是集合通信 →
-    必须由**所有 rank**进入（本函数在所有 rank 上被调用）。非 ZeRO-3 / 无 deepspeed 时参数本就
-    完整，直接算。范数按参数平方和的平方根聚合（等价把所有 LoRA A/B 拼成一个向量取 L2 范数）。
+    size-0 的假 0 / 偏小值。故用 safe_get_full_fp32_param（同 save_lora）逐参数读完整权重再算范数
+    （不用 GatheredParameters，规避诊断 forward 后 'active in submodules' 崩）。safe_get 内部
+    all-gather，所有 rank 须同序对每个参数调用（本函数在所有 rank 上被调用）。非 ZeRO-3 / 无 deepspeed
+    时参数本就完整，回退 p.data。范数按参数平方和的平方根聚合（等价把所有 LoRA A/B 拼成一个向量取 L2）。
     """
     unwrapped = accelerator.unwrap_model(model)
     lora_named = [(n, p) for n, p in unwrapped.named_parameters()
@@ -808,34 +836,21 @@ def _measure_lora_norms(model: nn.Module, accelerator) -> Dict[str, float]:
     a_named = [(n, p) for n, p in lora_named if ".lora_A." in n]
     b_named = [(n, p) for n, p in lora_named if ".lora_B." in n]
 
-    def _agg_norm(named):
-        total_sq = 0.0
-        for _, p in named:
-            d = p.data
-            if d is None or d.numel() == 0:
-                continue
-            total_sq += float(d.detach().float().norm().item()) ** 2
-        return total_sq ** 0.5
-
-    # 逐参数 gather（同 save_lora）：规避 bulk GatheredParameters 的 in-flight 分区竞争。
-    try:
-        import deepspeed
-        a_sq = 0.0
-        b_sq = 0.0
-        for n, p in lora_named:
-            with deepspeed.zero.GatheredParameters([p], modifier_rank=0):
-                d = p.data
-                if d is not None and d.numel() > 0:
-                    v = float(d.detach().float().norm().item()) ** 2
-                    if ".lora_A." in n:
-                        a_sq += v
-                    else:
-                        b_sq += v
-        a_norm = a_sq ** 0.5
-        b_norm = b_sq ** 0.5
-    except (ImportError, AttributeError):
-        a_norm = _agg_norm(a_named)
-        b_norm = _agg_norm(b_named)
+    # 用 safe_get_full_fp32_param 逐参数读完整权重（同 save_lora，**不用 GatheredParameters**，
+    # 规避 'active in submodules' / 'in flight' 崩）。所有 rank 同序对每个参数调用（内部 all-gather）。
+    reader, _ = _full_param_reader()
+    a_sq = 0.0
+    b_sq = 0.0
+    for n, p in lora_named:
+        full = _read_full_param(p, reader)
+        if full is not None and full.numel() > 0:
+            v = float(full.detach().float().norm().item()) ** 2
+            if ".lora_A." in n:
+                a_sq += v
+            else:
+                b_sq += v
+    a_norm = a_sq ** 0.5
+    b_norm = b_sq ** 0.5
 
     return {"diag/lora_A_norm": float(a_norm), "diag/lora_B_norm": float(b_norm)}
 
