@@ -811,8 +811,17 @@ def _get_dino_model(device: torch.device):
     if _DINO_MODEL is not None and _DINO_DEVICE == device:
         return _DINO_MODEL
     try:
+        import os
         import torch.hub  # noqa: F401（确保 hub 可用）
-        model = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14")
+        # 离线优先：若本地已缓存 repo，用 source='local' 直接加载，绝不联网校验分支
+        # （torch.hub.load 默认会去 GitHub 校验 fork，离线机器会抛 "Remote end closed connection"）。
+        local_repo = os.path.join(torch.hub.get_dir(), "facebookresearch_dinov2_main")
+        if os.path.isdir(local_repo):
+            model = torch.hub.load(local_repo, "dinov2_vits14", source="local")
+            logger.info("DINOv2 (dinov2_vits14) 从本地缓存加载 → %s", local_repo)
+        else:
+            model = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14")
+            logger.info("DINOv2 (dinov2_vits14) 从 torch.hub 联网加载")
         model = model.to(device).eval()
         _DINO_MODEL = model
         _DINO_DEVICE = device
