@@ -20,6 +20,14 @@ RAFT_COLUMNS = (
     "raft_weights",
     "metric_version",
     "generated_video",
+    "run_fingerprint",
+    "manifest_digest",
+    "input_video_digest",
+    "reference_digest",
+    "mask_digest",
+    "mask_provenance_digest",
+    "producer",
+    "producer_version",
 )
 
 
@@ -43,6 +51,10 @@ def validate_raft_scores(
     *,
     runs: Sequence[Mapping[str, Any]],
     total_frames: int,
+    manifest_digest: str | None = None,
+    reference_digest: str | None = None,
+    mask_digest: str | None = None,
+    mask_provenance_digest: str | None = None,
 ) -> dict[tuple[str, str, int, str, int], float]:
     """Require one finite score for every matched run/frame, with source identity."""
     validate_matched_run_invariants(list(runs), require_complete=True)
@@ -75,7 +87,21 @@ def validate_raft_scores(
         run = expected_runs[key4]
         if str(row["generated_video"]) != str(run["video"]):
             raise ValueError(f"RAFT generated_video mismatch for {key}")
-        for field in ("raft_model", "raft_weights", "metric_version"):
+        expected_identity = {
+            "run_fingerprint": str(run.get("run_fingerprint", "")),
+            "manifest_digest": str(manifest_digest or run.get("manifest_digest", "")),
+            "input_video_digest": str(run.get("input_video_digest", "")),
+            "reference_digest": str(reference_digest or run.get("reference_digest", "")),
+            "mask_digest": str(mask_digest or run.get("mask_digest", "")),
+            "mask_provenance_digest": str(
+                mask_provenance_digest or run.get("mask_provenance_digest", "")),
+        }
+        for field, expected_value in expected_identity.items():
+            if not expected_value or str(row[field]) != expected_value:
+                raise ValueError(f"RAFT {field} mismatch for {key}")
+        for field in (
+            "raft_model", "raft_weights", "metric_version", "producer", "producer_version",
+        ):
             if not str(row[field]).strip():
                 raise ValueError(f"RAFT {field} must be non-empty for {key}")
         value = float(row["raft_gated_anti_freeze"])

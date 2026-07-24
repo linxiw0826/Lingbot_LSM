@@ -16,6 +16,8 @@ if str(_SRC) not in sys.path:
 
 from pipeline.v7.phase1.manifest import load_manifest  # noqa: E402
 from pipeline.v7.phase1.provenance import (  # noqa: E402
+    file_digest,
+    stable_fingerprint,
     validate_matched_run_invariants,
     validate_run_index_entry,
 )
@@ -28,6 +30,8 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--gt_full", required=True)
     parser.add_argument("--runs_index", required=True)
+    parser.add_argument("--static_mask", required=True)
+    parser.add_argument("--mask_provenance", required=True)
     parser.add_argument("--output_csv", required=True)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
@@ -94,6 +98,10 @@ def main() -> None:
     if device.type != "cuda" or not torch.cuda.is_available():
         raise SystemExit("official RAFT evidence generation requires CUDA")
     model, transforms, weights_id = _load_model(device, args.weights_path)
+    manifest_digest = file_digest(args.manifest)
+    reference_digest = file_digest(args.gt_full)
+    mask_digest = file_digest(args.static_mask)
+    mask_provenance_digest = file_digest(args.mask_provenance)
     gt_hwc = np.transpose(gt, (1, 2, 3, 0))
     gt_motion = [0.0]
     for frame in range(1, manifest["total_frames"]):
@@ -124,6 +132,14 @@ def main() -> None:
                 "raft_weights": weights_id,
                 "metric_version": "phase1_raft_motion_ratio_v1",
                 "generated_video": run["video"],
+                "run_fingerprint": stable_fingerprint(run),
+                "manifest_digest": manifest_digest,
+                "input_video_digest": file_digest(run["video"]),
+                "reference_digest": reference_digest,
+                "mask_digest": mask_digest,
+                "mask_provenance_digest": mask_provenance_digest,
+                "producer": "pipeline.v7.phase1.raft_cli",
+                "producer_version": "1",
             })
     output = Path(args.output_csv)
     output.parent.mkdir(parents=True, exist_ok=True)

@@ -1,0 +1,20 @@
+{
+  "schema_version": "phase1_guardrails_v1",
+  "thresholds": {
+    "raft_gated_anti_freeze": {
+      "threshold": null
+    },
+    "seam": {
+      "threshold": null
+    },
+    "non_support_quality": {
+      "threshold": null
+    },
+    "action_following": {
+      "threshold": null
+    },
+    "copy_leakage": {
+      "threshold": null
+    }
+  }
+}

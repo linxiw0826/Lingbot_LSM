@@ -8,6 +8,7 @@ set -euo pipefail
 : "${CKPT_DIR:?export CKPT_DIR (LingBot-World base checkpoint)}"
 : "${PHASE1_OUTPUT_ROOT:?export PHASE1_OUTPUT_ROOT}"
 : "${STATIC_MASK_ROOT:?export STATIC_MASK_ROOT (case_id/static_mask.npy + mask_provenance.json)}"
+: "${PHASE1_GUARDRAIL_CONFIG:?export PHASE1_GUARDRAIL_CONFIG (reviewed before generation; threshold-only JSON)}"
 
 LORA_PATH="${LORA_PATH:-}"
 # Optional assertion only. Seeds are authoritative in each event manifest.
@@ -22,3 +23,4 @@ PHASE1_SHA="${PHASE1_SHA:-$(git rev-parse HEAD)}"
 export CASES_ROOT CKPT_DIR PHASE1_OUTPUT_ROOT STATIC_MASK_ROOT LORA_PATH
 export PHASE1_SEEDS PHASE1_STEPS PHASE1_SEAM_BUFFER PHASE1_GPUS
 export PHASE1_MANIFEST_DIR PHASE1_SHA
+export PHASE1_GUARDRAIL_CONFIG

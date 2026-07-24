@@ -22,6 +22,7 @@ ARGS=(
   --output_dir "${OUT}" --ckpt_dir "${CKPT_DIR}" --device cuda:0
   --num_inference_steps "${PHASE1_STEPS}" --seam_buffer "${PHASE1_SEAM_BUFFER}"
   --commit_sha "${PHASE1_SHA}"
+  --guardrail_config "${PHASE1_GUARDRAIL_CONFIG}"
 )
 if [ -n "${LORA_PATH}" ]; then ARGS+=(--lora_path "${LORA_PATH}"); fi
 CUDA_VISIBLE_DEVICES="${GPU}" python src/pipeline/v7/phase1/run.py "${ARGS[@]}"

@@ -27,6 +27,7 @@ from pipeline.v7.phase1.jobs import (  # noqa: E402
     anchor_enabled,
     build_matched_jobs,
 )
+from pipeline.v7.phase1.guardrails import load_guardrail_config  # noqa: E402
 from pipeline.v7.phase1.manifest import load_manifest, manifest_seeds  # noqa: E402
 from pipeline.v7.phase1.planner import slice_modalities, stitch_owned  # noqa: E402
 from pipeline.v7.phase1.provenance import (  # noqa: E402
@@ -77,6 +78,9 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--fps", type=int, default=16)
     run.add_argument("--prompt")
     run.add_argument("--commit_sha")
+    run.add_argument(
+        "--guardrail_config", required=True,
+        help="preregistered threshold-only config fingerprinted into every matched run")
     return parser
 
 
@@ -176,6 +180,7 @@ def _run(args: argparse.Namespace) -> None:
     if args.frame_num != 81:
         raise SystemExit("Phase 1 frozen planner requires --frame_num 81")
     manifest = load_manifest(args.manifest, require_review=True)
+    guardrail_config = load_guardrail_config(args.guardrail_config)
     registered_seeds = manifest_seeds(manifest, min_count=3)
     if args.seed not in registered_seeds:
         raise SystemExit(
@@ -317,6 +322,7 @@ def _run(args: argparse.Namespace) -> None:
             "tokens_per_anchor_frame": tokens_per_anchor,
         },
         "actual_output_frames": int(stitched.shape[0]),
+        "guardrail_config": guardrail_config,
     }
     invariant_fingerprints = build_invariant_fingerprints(invariant_evidence)
     provenance = {

@@ -36,6 +36,8 @@ PY
     RAFT_ARGS=(
       --manifest "${manifest}"
       --gt_full "${CASES_ROOT}/${case_id}/ground_truth_full.mp4"
+      --static_mask "${STATIC_MASK_ROOT}/${case_id}/static_mask.npy"
+      --mask_provenance "${STATIC_MASK_ROOT}/${case_id}/mask_provenance.json"
       --runs_index "${case_index}" --output_csv "${raft_csv}" --device cuda:0
     )
     if [ -n "${RAFT_WEIGHTS_PATH:-}" ]; then
@@ -55,9 +57,16 @@ PY
 done
 python src/pipeline/v7/phase1/collect.py csv "${CSV_ARGS[@]}" \
   --output "${RUN_ROOT}/per_frame_all.csv"
-GUARDRAIL_ARGS=()
-if [ -n "${PHASE1_GUARDRAILS_JSON:-}" ]; then
-  GUARDRAIL_ARGS+=(--guardrails_json "${PHASE1_GUARDRAILS_JSON}")
+GUARDRAIL_ARGS=(--guardrail_config "${PHASE1_GUARDRAIL_CONFIG}")
+if [ -n "${PHASE1_GUARDRAIL_EVIDENCE_ROOT:-}" ]; then
+  for name in seam action_following copy_leakage; do
+    evidence="${PHASE1_GUARDRAIL_EVIDENCE_ROOT}/${name}.csv"
+    if [ ! -f "${evidence}" ]; then
+      echo "[ERROR] external guardrail evidence missing: ${evidence}" >&2
+      exit 2
+    fi
+    GUARDRAIL_ARGS+=(--guardrail_evidence "${name}=${evidence}")
+  done
 fi
 SEED_ARGS=()
 if [ -n "${PHASE1_SEEDS}" ]; then SEED_ARGS+=(--seeds "${PHASE1_SEEDS}"); fi
@@ -65,6 +74,7 @@ python src/pipeline/v7/phase1/eval_cli.py aggregate \
   --per_frame_csv "${RUN_ROOT}/per_frame_all.csv" \
   --output_json "${RUN_ROOT}/aggregate.json" \
   --output_csv "${RUN_ROOT}/aggregate.csv" \
+  --runs_index "${RUN_INDEX}" --seam_buffer "${PHASE1_SEAM_BUFFER}" \
   --manifest_dir "${PHASE1_MANIFEST_DIR}" --min_seeds 3 \
   "${SEED_ARGS[@]}" \
   "${GUARDRAIL_ARGS[@]}"

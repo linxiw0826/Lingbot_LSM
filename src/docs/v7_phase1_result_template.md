@@ -19,6 +19,10 @@
 - `runs_index.json`:
 - `per_frame_all.csv`:
 - Per-case RAFT evidence CSVs:
+- Preregistered guardrail config + fingerprint:
+- Seam per-frame evidence CSV + producer/version:
+- Action-following per-frame evidence CSV + producer/version:
+- Copy/leakage per-frame evidence CSV + producer/version:
 - `aggregate.json`:
 - `aggregate.csv`:
 - Videos:
@@ -40,6 +44,8 @@
 - correct_local-wrong_local case-bootstrap 95% CI:
 - Missing four-arm tuples:
 - Cross-arm invariant fingerprint verification:
+- Four-way guardrail-config fingerprint verification
+  (standalone CSV / embedded row / run provenance / current canonical config):
 - Rejected SHA/checkpoint/config/window/source-mapping mismatches:
 - Support summary:
 - Non-support summary:
@@ -56,8 +62,13 @@
 - RAFT-gated anti-freeze:
 - RAFT-gated masked-DINO:
 - RAFT tuple/frame coverage:
+- Formal expected-universe coverage
+  (manifest × events × seeds × four arms × support/non-support/seam):
+- Missing/duplicate expected frames, tuples, or whole regions:
 - RAFT model / weights / metric version:
 - Guardrail result (`passed` / `failed` / `INCONCLUSIVE`):
+- Guardrail values recomputed by code (no summary values accepted):
+- Run/manifest/video/reference/mask digest verification:
 - Seam observations/metric:
 - Non-support quality:
 - Copy/leakage:

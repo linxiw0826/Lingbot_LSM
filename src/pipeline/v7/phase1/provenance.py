@@ -30,6 +30,7 @@ MATCHED_INVARIANTS = (
     "trajectory",
     "planned_anchor_budget",
     "actual_output_frames",
+    "guardrail_config",
 )
 
 
@@ -38,6 +39,15 @@ def stable_fingerprint(value: Any) -> str:
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def file_digest(path: str | Path) -> str:
+    """SHA-256 a formal evidence input without trusting its filename."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def build_invariant_fingerprints(evidence: Mapping[str, Any]) -> dict[str, str]:

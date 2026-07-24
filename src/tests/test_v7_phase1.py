@@ -15,9 +15,17 @@ from pipeline.v7.phase1.evaluation import (
     aggregate_primary,
     case_cluster_bootstrap,
     gate_verdict,
-    validate_guardrails,
     summarize_regions,
     validate_shared_mask,
+)
+from pipeline.v7.phase1.guardrails import (
+    EVIDENCE_COLUMNS,
+    GUARDRAIL_SPECS,
+    GuardrailError,
+    build_expected_region_universe,
+    derive_guardrails,
+    guardrail_config_fingerprint,
+    load_guardrail_config,
 )
 from pipeline.v7.phase1.collect import collect_indexes
 from pipeline.v7.phase1.jobs import PRIMARY_ARMS, anchor_enabled, build_matched_jobs
@@ -31,6 +39,7 @@ from pipeline.v7.phase1.planner import (
 )
 from pipeline.v7.phase1.provenance import (
     build_invariant_fingerprints,
+    stable_fingerprint,
     validate_matched_run_invariants,
     validate_provenance,
     validate_run_index_entry,
@@ -184,6 +193,16 @@ def _invariant_evidence():
         "trajectory": {"pose": "p", "action": "a", "intrinsics": "i"},
         "planned_anchor_budget": {"anchor_frames": 1, "tokens_per_anchor_frame": 10},
         "actual_output_frames": 10,
+        "guardrail_config": _guardrail_config(),
+    }
+
+
+def _guardrail_config(threshold=1.0):
+    return {
+        "schema_version": "phase1_guardrails_v1",
+        "thresholds": {
+            name: {"threshold": threshold} for name in GUARDRAIL_SPECS
+        },
     }
 
 
@@ -237,7 +256,14 @@ def test_static_mask_is_shared_and_traceable():
 
 def _evaluation_rows(cases=5, seeds=3):
     rows = []
-    fingerprints = json.dumps(build_invariant_fingerprints(_invariant_evidence()))
+    evidence = _invariant_evidence()
+    evidence["query_support"] = [0, 2]
+    evidence["planner_windows"] = [
+        plan.to_dict() for plan in plan_windows(4, (0, 2), seam_buffer=1)
+    ]
+    evidence["actual_output_frames"] = 4
+    fingerprints = json.dumps(build_invariant_fingerprints(evidence))
+    config_fp = guardrail_config_fingerprint(_guardrail_config())
     for ci in range(cases):
         for event in ("e0", "e1"):
             for seed in range(seeds):
@@ -246,13 +272,15 @@ def _evaluation_rows(cases=5, seeds=3):
                     "correct_local": 0.70 + ci * 0.001, "wrong_local": 0.45,
                 }
                 for arm, value in values.items():
-                    for frame in (0, 1):
+                    for frame in range(4):
                         rows.append({
                             "case_id": f"c{ci}", "event_id": event, "seed": seed,
-                            "arm": arm, "frame": frame, "region": "support",
+                            "arm": arm, "frame": frame,
+                            "region": "support" if frame < 2 else "non_support",
                             "masked_dino": value, "full_dino": value - 0.01,
                             "ssim": value - 0.02, "raft_gated_anti_freeze": "",
                             "invariant_fingerprints": fingerprints,
+                            "guardrail_config_fingerprint": config_fp,
                         })
     return rows
 
@@ -310,6 +338,7 @@ def _evaluation_manifests():
     return {
         f"c{ci}": {
             "case_id": f"c{ci}",
+            "total_frames": 4,
             "evaluation_seeds": [0, 1, 2],
             "revisit_events": [
                 {"event_id": "e0", "query_start": 0, "query_end": 2},
@@ -392,23 +421,217 @@ def test_statistical_pass_cannot_be_go_while_guardrails_pending():
         min_seeds=3)
     aggregate["region_summaries"] = summarize_regions(rows)
     verdict = gate_verdict(aggregate, bootstrap_seed=7)
-    assert verdict["status"] == "STATISTICAL_PASS"
+    assert verdict["status"] == "INCONCLUSIVE"
     assert verdict["guardrails"]["complete"] is False
 
 
-def test_guardrail_threshold_contract_rejects_claim_mismatch():
-    guardrails = {
-        name: {
-            "provided": True, "passed": True, "metric": name,
-            "value": 0.2, "threshold": 0.1, "direction": "max",
-        }
-        for name in (
-            "raft_gated_anti_freeze", "seam", "non_support_quality",
-            "action_following", "copy_leakage",
-        )
+def test_guardrail_config_rejects_metric_value_pass_and_unrelated_name(tmp_path):
+    bad = _guardrail_config()
+    bad["thresholds"]["seam"] = {
+        "threshold": 1.0, "metric": "totally_unrelated", "value": 0.0, "passed": True,
     }
-    with pytest.raises(EvaluationError, match="contradicts"):
-        validate_guardrails(guardrails)
+    path = tmp_path / "bad.json"
+    path.write_text(json.dumps(bad), encoding="utf-8")
+    with pytest.raises(GuardrailError, match="only preregistered"):
+        load_guardrail_config(path)
+    bad = _guardrail_config()
+    bad["thresholds"]["totally_unrelated"] = {"threshold": 1.0}
+    path.write_text(json.dumps(bad), encoding="utf-8")
+    with pytest.raises(GuardrailError, match="exactly"):
+        load_guardrail_config(path)
+
+
+def _guardrail_rows():
+    rows = _evaluation_rows()
+    for row in rows:
+        row.update(
+            raft_gated_anti_freeze=0.9,
+            run_fingerprint=f"run-{row['case_id']}-{row['event_id']}-{row['seed']}-{row['arm']}",
+            manifest_digest=f"manifest-{row['case_id']}",
+            input_video_digest=f"video-{row['case_id']}-{row['event_id']}-{row['seed']}-{row['arm']}",
+            reference_digest=f"reference-{row['case_id']}",
+            mask_digest=f"mask-{row['case_id']}",
+            mask_provenance_digest=f"mask-provenance-{row['case_id']}",
+        )
+        if row["region"] == "non_support":
+            row["masked_dino"] = 0.8
+    return rows
+
+
+def _guardrail_runs():
+    runs = {}
+    for ci in range(5):
+        for event in ("e0", "e1"):
+            evidence = _invariant_evidence()
+            evidence["query_support"] = [0, 2]
+            evidence["planner_windows"] = [
+                plan.to_dict() for plan in plan_windows(4, (0, 2), seam_buffer=1)
+            ]
+            evidence["actual_output_frames"] = 4
+            fingerprints = build_invariant_fingerprints(evidence)
+            for seed in range(3):
+                for arm in PRIMARY_ARMS:
+                    runs[(f"c{ci}", event, seed, arm)] = {
+                        "invariant_fingerprints": dict(fingerprints),
+                    }
+    return runs
+
+
+def _external_guardrail_evidence(name, rows):
+    spec = GUARDRAIL_SPECS[name]
+    universes = build_expected_region_universe(
+        _evaluation_manifests(), seeds=[0, 1, 2], seam_buffer=1)
+    region = {
+        "seam": "seam",
+        "action_following": "all",
+        "copy_leakage": "non_support",
+    }[name]
+    expected = universes[region]
+    evidence = []
+    for row in rows:
+        identity = (
+            row["case_id"], row["event_id"], int(row["seed"]),
+            row["arm"], int(row["frame"]),
+        )
+        if identity not in expected:
+            continue
+        value = 0.1 if row["arm"] == "correct_local" else 0.2
+        evidence.append({
+            "guardrail": name,
+            "metric": spec["metric"],
+            "case_id": row["case_id"],
+            "event_id": row["event_id"],
+            "seed": row["seed"],
+            "arm": row["arm"],
+            "frame": row["frame"],
+            "value": value,
+            "run_fingerprint": row["run_fingerprint"],
+            "manifest_digest": row["manifest_digest"],
+            "input_video_digest": row["input_video_digest"],
+            "reference_digest": row["reference_digest"],
+            "mask_digest": row["mask_digest"],
+            "mask_provenance_digest": row["mask_provenance_digest"],
+            "producer": "official-test-producer",
+            "producer_version": "1",
+        })
+    assert tuple(evidence[0]) == EVIDENCE_COLUMNS
+    return evidence
+
+
+def _derive_guardrails(rows, *, config=None, external_evidence=None):
+    return derive_guardrails(
+        rows,
+        config=config or _guardrail_config(),
+        manifests=_evaluation_manifests(),
+        runs=_guardrail_runs(),
+        seeds=[0, 1, 2],
+        seam_buffer=1,
+        external_evidence=external_evidence,
+    )
+
+
+def test_complete_identity_linked_guardrail_evidence_is_computed_not_claimed():
+    rows = _guardrail_rows()
+    evidence = {
+        name: _external_guardrail_evidence(name, rows)
+        for name in ("seam", "action_following", "copy_leakage")
+    }
+    result = _derive_guardrails(rows, external_evidence=evidence)
+    assert result["complete"] is True
+    assert result["passed"] is True
+    assert all(item["status"] == "PASS" for item in result["results"].values())
+    aggregate = aggregate_primary(
+        rows, manifests=_evaluation_manifests(), seeds=[0, 1, 2], min_seeds=3)
+    aggregate["region_summaries"] = summarize_regions(rows)
+    assert gate_verdict(aggregate, guardrails=result)["status"] == "GO"
+
+
+def test_detached_external_guardrail_artifact_is_inconclusive():
+    rows = _guardrail_rows()
+    evidence = {
+        name: _external_guardrail_evidence(name, rows)
+        for name in ("seam", "action_following", "copy_leakage")
+    }
+    evidence["seam"][0]["run_fingerprint"] = "detached"
+    result = _derive_guardrails(rows, external_evidence=evidence)
+    assert result["complete"] is False
+    assert result["results"]["seam"]["status"] == "INCONCLUSIVE"
+
+
+def test_post_result_threshold_change_and_missing_external_evidence_are_inconclusive():
+    rows = _guardrail_rows()
+    changed = _guardrail_config(threshold=0.5)
+    changed_fp = guardrail_config_fingerprint(changed)
+    for row in rows:
+        # Attacker rewrites both the threshold file and its standalone CSV
+        # column, but cannot rewrite generation-time provenance/invariants.
+        row["guardrail_config_fingerprint"] = changed_fp
+    with pytest.raises(GuardrailError, match="fingerprint chain mismatch"):
+        _derive_guardrails(rows, config=changed)
+    for row in rows:
+        row["guardrail_config_fingerprint"] = guardrail_config_fingerprint(
+            _guardrail_config())
+    result = _derive_guardrails(rows)
+    assert result["complete"] is False
+    assert set(result["missing"]) == {"seam", "action_following", "copy_leakage"}
+
+
+def test_guardrail_formal_universe_rejects_missing_frame_and_entire_tuple():
+    rows = _guardrail_rows()
+    one_missing = rows[1:]
+    with pytest.raises(GuardrailError, match="scored evidence missing"):
+        _derive_guardrails(one_missing)
+    tuple_missing = [
+        row for row in rows
+        if not (
+            row["case_id"] == "c0" and row["event_id"] == "e0"
+            and row["seed"] == 0 and row["arm"] == "off"
+        )
+    ]
+    with pytest.raises(GuardrailError, match="scored evidence missing"):
+        _derive_guardrails(tuple_missing)
+
+
+@pytest.mark.parametrize(
+    ("metric", "region", "guardrail"),
+    [
+        ("raft_gated_anti_freeze", "support", "raft_gated_anti_freeze"),
+        ("masked_dino", "non_support", "non_support_quality"),
+    ],
+)
+def test_guardrail_scored_metric_requires_every_expected_frame(
+    metric, region, guardrail,
+):
+    rows = _guardrail_rows()
+    target = next(row for row in rows if row["region"] == region)
+    target[metric] = ""
+    evidence = {
+        name: _external_guardrail_evidence(name, rows)
+        for name in ("seam", "action_following", "copy_leakage")
+    }
+    result = _derive_guardrails(rows, external_evidence=evidence)
+    assert result["complete"] is False
+    assert result["results"][guardrail]["status"] == "INCONCLUSIVE"
+    assert "required frame" in result["results"][guardrail]["reason"]
+
+
+def test_external_evidence_requires_frame_and_whole_region_coverage():
+    rows = _guardrail_rows()
+    evidence = {
+        name: _external_guardrail_evidence(name, rows)
+        for name in ("seam", "action_following", "copy_leakage")
+    }
+    missing_frame = copy.deepcopy(evidence)
+    missing_frame["copy_leakage"] = missing_frame["copy_leakage"][:-1]
+    result = _derive_guardrails(rows, external_evidence=missing_frame)
+    assert result["results"]["copy_leakage"]["status"] == "INCONCLUSIVE"
+    assert "evidence missing 1" in result["results"]["copy_leakage"]["reason"]
+
+    missing_region = copy.deepcopy(evidence)
+    missing_region["seam"] = []
+    result = _derive_guardrails(rows, external_evidence=missing_region)
+    assert result["results"]["seam"]["status"] == "INCONCLUSIVE"
+    assert "evidence missing" in result["results"]["seam"]["reason"]
 
 
 def test_raft_unavailable_is_explicit_and_makes_gate_inconclusive():
@@ -463,6 +686,12 @@ def test_raft_evidence_requires_exact_tuple_frame_and_attaches_gated_score():
             )
         }
         entry["provenance"] = f"{arm}.json"
+        entry["run_fingerprint"] = stable_fingerprint(entry)
+        entry["manifest_digest"] = "manifest"
+        entry["input_video_digest"] = "video-digest"
+        entry["reference_digest"] = "reference"
+        entry["mask_digest"] = "mask"
+        entry["mask_provenance_digest"] = "mask-provenance"
         runs.append(entry)
         for frame in range(10):
             rows.append({
@@ -470,8 +699,19 @@ def test_raft_evidence_requires_exact_tuple_frame_and_attaches_gated_score():
                 "frame": frame, "raft_gated_anti_freeze": 0.5,
                 "raft_model": "raft", "raft_weights": "w", "metric_version": "v1",
                 "generated_video": "video.mp4",
+                "run_fingerprint": entry["run_fingerprint"],
+                "manifest_digest": "manifest",
+                "input_video_digest": "video-digest",
+                "reference_digest": "reference",
+                "mask_digest": "mask",
+                "mask_provenance_digest": "mask-provenance",
+                "producer": "official",
+                "producer_version": "1",
             })
-    scores = validate_raft_scores(rows, runs=runs, total_frames=10)
+    scores = validate_raft_scores(
+        rows, runs=runs, total_frames=10,
+        manifest_digest="manifest", reference_digest="reference",
+        mask_digest="mask", mask_provenance_digest="mask-provenance")
     records = [{
         "case_id": key[0], "event_id": key[1], "seed": key[2],
         "arm": key[3], "frame": key[4], "masked_dino": 0.8,
@@ -479,7 +719,19 @@ def test_raft_evidence_requires_exact_tuple_frame_and_attaches_gated_score():
     attach_raft_scores(records, scores)
     assert all(row["raft_gated_masked_dino"] == pytest.approx(0.4) for row in records)
     with pytest.raises(ValueError, match="missing"):
-        validate_raft_scores(rows[:-1], runs=runs, total_frames=10)
+        validate_raft_scores(
+            rows[:-1], runs=runs, total_frames=10,
+            manifest_digest="manifest", reference_digest="reference",
+            mask_digest="mask", mask_provenance_digest="mask-provenance")
+    contradictory = copy.deepcopy(rows)
+    contradictory[0]["raft_gated_anti_freeze"] = 0.0
+    altered = copy.deepcopy(contradictory)
+    altered[0]["run_fingerprint"] = "forged-summary-link"
+    with pytest.raises(ValueError, match="run_fingerprint"):
+        validate_raft_scores(
+            altered, runs=runs, total_frames=10,
+            manifest_digest="manifest", reference_digest="reference",
+            mask_digest="mask", mask_provenance_digest="mask-provenance")
 
 
 def test_v6_default_entry_was_not_modified_for_phase1():

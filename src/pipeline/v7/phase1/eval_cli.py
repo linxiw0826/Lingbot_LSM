@@ -22,8 +22,15 @@ from pipeline.v7.phase1.evaluation import (  # noqa: E402
     validate_shared_mask,
     write_aggregate,
 )
+from pipeline.v7.phase1.guardrails import (  # noqa: E402
+    GUARDRAIL_SPECS,
+    load_guardrail_config,
+    read_external_evidence,
+)
 from pipeline.v7.phase1.manifest import load_manifest  # noqa: E402
 from pipeline.v7.phase1.provenance import (  # noqa: E402
+    file_digest,
+    stable_fingerprint,
     validate_matched_run_invariants,
     validate_run_index_entry,
 )
@@ -48,7 +55,16 @@ def _parse_args() -> argparse.Namespace:
     aggregate.add_argument(
         "--seeds",
         help="optional assertion; set must exactly equal every manifest evaluation_seeds")
-    aggregate.add_argument("--guardrails_json")
+    aggregate.add_argument(
+        "--guardrail_config",
+        help="threshold-only preregistration file fingerprinted into generation runs")
+    aggregate.add_argument(
+        "--runs_index",
+        help="authoritative generation run index; required with --guardrail_config")
+    aggregate.add_argument("--seam_buffer", type=int, default=8)
+    aggregate.add_argument(
+        "--guardrail_evidence", action="append", default=[],
+        help="NAME=CSV for seam/action_following/copy_leakage per-frame evidence")
 
     score = sub.add_parser("score")
     score.add_argument("--manifest", required=True)
@@ -82,6 +98,10 @@ def _score(args: argparse.Namespace) -> None:
     with open(args.mask_provenance, encoding="utf-8") as handle:
         mask_provenance = json.load(handle)
     validate_shared_mask(mask, manifest["total_frames"], mask_provenance)
+    manifest_digest = file_digest(args.manifest)
+    mask_digest = file_digest(args.static_mask)
+    mask_provenance_digest = file_digest(args.mask_provenance)
+    reference_digest = file_digest(args.gt_full)
     with open(args.runs_index, encoding="utf-8") as handle:
         runs = json.load(handle)
     if not isinstance(runs, list) or not runs:
@@ -103,10 +123,19 @@ def _score(args: argparse.Namespace) -> None:
         validated_runs.append(run)
     try:
         validate_matched_run_invariants(validated_runs, require_complete=True)
+        for run in validated_runs:
+            run["run_fingerprint"] = stable_fingerprint(run)
+            run["manifest_digest"] = manifest_digest
+            run["input_video_digest"] = file_digest(run["video"])
+            run["reference_digest"] = reference_digest
         raft_scores = validate_raft_scores(
             read_raft_scores(args.raft_scores_csv),
             runs=validated_runs,
             total_frames=manifest["total_frames"],
+            manifest_digest=manifest_digest,
+            reference_digest=reference_digest,
+            mask_digest=mask_digest,
+            mask_provenance_digest=mask_provenance_digest,
         )
     except ValueError as exc:
         raise EvaluationError(f"RAFT/matched evidence rejected: {exc}") from exc
@@ -132,6 +161,9 @@ def _score(args: argparse.Namespace) -> None:
         ):
             raise EvaluationError(f"generated video length mismatch: {run['video']}")
         event = events[run["event_id"]]
+        run_fingerprint = str(run["run_fingerprint"])
+        input_video_digest = file_digest(run["video"])
+        guardrail_config_fingerprint = run["invariant_fingerprints"]["guardrail_config"]
         for frame in range(manifest["total_frames"]):
             shared = mask[frame].astype(np.float32)[None]
             generated = video[:, frame] * shared
@@ -169,6 +201,13 @@ def _score(args: argparse.Namespace) -> None:
                     _to_gray_uint8(gt[:, frame]),
                 )),
                 "mask_provenance": args.mask_provenance,
+                "run_fingerprint": run_fingerprint,
+                "manifest_digest": manifest_digest,
+                "input_video_digest": input_video_digest,
+                "reference_digest": reference_digest,
+                "mask_digest": mask_digest,
+                "mask_provenance_digest": mask_provenance_digest,
+                "guardrail_config_fingerprint": guardrail_config_fingerprint,
                 "invariant_fingerprints": json.dumps(
                     run["invariant_fingerprints"], sort_keys=True),
             })
@@ -205,10 +244,59 @@ def main() -> None:
             if case_id in manifests:
                 raise EvaluationError(f"duplicate manifest case_id: {case_id}")
             manifests[case_id] = manifest
-        guardrails = None
-        if args.guardrails_json:
-            with open(args.guardrails_json, encoding="utf-8") as handle:
-                guardrails = json.load(handle)
+        guardrail_config = (
+            load_guardrail_config(args.guardrail_config)
+            if args.guardrail_config else None
+        )
+        guardrail_runs = None
+        if guardrail_config is not None:
+            if not args.runs_index:
+                raise EvaluationError(
+                    "--runs_index is required with --guardrail_config")
+            with open(args.runs_index, encoding="utf-8") as handle:
+                run_entries = json.load(handle)
+            if not isinstance(run_entries, list) or not run_entries:
+                raise EvaluationError("runs_index must contain a non-empty list")
+            guardrail_runs = {}
+            validated_entries = []
+            for entry in run_entries:
+                case_id = str(entry.get("case_id", ""))
+                manifest = manifests.get(case_id)
+                if manifest is None:
+                    raise EvaluationError(
+                        f"run index references case absent from formal manifests: {case_id}")
+                with open(entry["provenance"], encoding="utf-8") as handle:
+                    provenance = json.load(handle)
+                try:
+                    validate_run_index_entry(entry, provenance, manifest=manifest)
+                except ValueError as exc:
+                    raise EvaluationError(
+                        f"invalid authoritative run provenance: {exc}") from exc
+                key = (
+                    case_id, str(entry["event_id"]), int(entry["seed"]),
+                    str(entry["arm"]),
+                )
+                if key in guardrail_runs:
+                    raise EvaluationError(
+                        f"duplicate authoritative run provenance: {key}")
+                guardrail_runs[key] = provenance
+                validated_entries.append(entry)
+            try:
+                validate_matched_run_invariants(
+                    validated_entries, require_complete=True)
+            except ValueError as exc:
+                raise EvaluationError(
+                    f"authoritative matched runs rejected: {exc}") from exc
+        evidence = {}
+        for assignment in args.guardrail_evidence:
+            if "=" not in assignment:
+                raise EvaluationError("--guardrail_evidence must be NAME=CSV")
+            name, path = assignment.split("=", 1)
+            if name not in GUARDRAIL_SPECS or GUARDRAIL_SPECS[name]["source"] != "external":
+                raise EvaluationError(f"unsupported external guardrail evidence name: {name}")
+            if name in evidence:
+                raise EvaluationError(f"duplicate guardrail evidence: {name}")
+            evidence[name] = read_external_evidence(path)
         write_aggregate(
             rows,
             args.output_json,
@@ -220,7 +308,10 @@ def main() -> None:
                 [int(value) for value in args.seeds.split(",")]
                 if args.seeds else None
             ),
-            guardrails=guardrails,
+            guardrail_config=guardrail_config,
+            guardrail_evidence=evidence,
+            guardrail_runs=guardrail_runs,
+            seam_buffer=args.seam_buffer,
         )
 
 

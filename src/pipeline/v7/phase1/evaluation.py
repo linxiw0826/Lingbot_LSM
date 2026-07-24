@@ -11,19 +11,11 @@ from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 
 import numpy as np
 
+from .guardrails import derive_guardrails
 from .manifest import manifest_seeds
 from .provenance import MATCHED_INVARIANTS
 
 PRIMARY_ARMS = ("off", "global", "correct_local", "wrong_local")
-REQUIRED_GUARDRAILS = (
-    "raft_gated_anti_freeze",
-    "seam",
-    "non_support_quality",
-    "action_following",
-    "copy_leakage",
-)
-
-
 class EvaluationError(ValueError):
     """Raised when formal primary evaluation evidence is incomplete."""
 
@@ -321,52 +313,6 @@ def case_cluster_bootstrap(
     }
 
 
-def validate_guardrails(guardrails: Mapping[str, Any] | None) -> Dict[str, Any]:
-    if guardrails is None:
-        return {"complete": False, "passed": False, "missing": list(REQUIRED_GUARDRAILS)}
-    missing = [name for name in REQUIRED_GUARDRAILS if name not in guardrails]
-    if missing:
-        return {"complete": False, "passed": False, "missing": missing}
-    normalized = {}
-    for name in REQUIRED_GUARDRAILS:
-        item = guardrails[name]
-        if not isinstance(item, Mapping):
-            raise EvaluationError(f"guardrail {name} must be an object")
-        for field in (
-            "provided", "passed", "metric", "value", "threshold", "direction",
-        ):
-            if field not in item:
-                raise EvaluationError(f"guardrail {name} missing {field}")
-        if item["provided"] is not True:
-            return {"complete": False, "passed": False, "missing": [name]}
-        if not isinstance(item["passed"], bool):
-            raise EvaluationError(f"guardrail {name}.passed must be boolean")
-        if not isinstance(item["metric"], str) or not item["metric"]:
-            raise EvaluationError(f"guardrail {name}.metric must be non-empty")
-        try:
-            value = float(item["value"])
-            threshold = float(item["threshold"])
-        except (TypeError, ValueError) as exc:
-            raise EvaluationError(
-                f"guardrail {name} value/threshold must be numeric") from exc
-        if not math.isfinite(value) or not math.isfinite(threshold):
-            raise EvaluationError(f"guardrail {name} value/threshold must be finite")
-        direction = item["direction"]
-        if direction not in {"min", "max"}:
-            raise EvaluationError(f"guardrail {name}.direction must be min or max")
-        computed_pass = value >= threshold if direction == "min" else value <= threshold
-        if item["passed"] is not computed_pass:
-            raise EvaluationError(
-                f"guardrail {name}.passed contradicts value/threshold/direction")
-        normalized[name] = dict(item)
-    return {
-        "complete": True,
-        "passed": all(item["passed"] for item in normalized.values()),
-        "missing": [],
-        "results": normalized,
-    }
-
-
 def gate_verdict(
     aggregate: Mapping[str, Any],
     *,
@@ -391,7 +337,14 @@ def gate_verdict(
         or aggregate.get("absent_complete_cases")
     )
     statistical_pass = all(outcomes[name]["passed"] for name in required)
-    guardrail_result = validate_guardrails(guardrails)
+    guardrail_result = guardrails or {
+        "complete": False, "passed": False,
+        "missing": [
+            "raft_gated_anti_freeze", "seam", "non_support_quality",
+            "action_following", "copy_leakage",
+        ],
+        "results": {},
+    }
     raft_unavailable = (
         aggregate["region_summaries"]["raft_gated_anti_freeze"]["status"] != "available"
     )
@@ -400,7 +353,7 @@ def gate_verdict(
     elif not statistical_pass:
         status = "NO-GO"
     elif not guardrail_result["complete"]:
-        status = "STATISTICAL_PASS"
+        status = "INCONCLUSIVE"
     elif guardrail_result["passed"]:
         status = "GO"
     else:
@@ -428,13 +381,36 @@ def write_aggregate(
     expected_cases: int = 5,
     min_seeds: int = 3,
     bootstrap_seed: int = 0,
-    guardrails: Mapping[str, Any] | None = None,
+    guardrail_config: Mapping[str, Any] | None = None,
+    guardrail_evidence: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
+    guardrail_runs: Mapping[
+        tuple[str, str, int, str], Mapping[str, Any]] | None = None,
+    seam_buffer: int = 8,
     output_csv: str | Path | None = None,
 ) -> Dict[str, Any]:
     aggregate = aggregate_primary(
         rows, manifests=manifests, seeds=seeds,
         expected_cases=expected_cases, min_seeds=min_seeds)
     aggregate["region_summaries"] = summarize_regions(rows)
+    if guardrail_config is None:
+        guardrails = None
+    else:
+        if guardrail_runs is None:
+            raise EvaluationError(
+                "guardrail aggregation requires authoritative run provenance")
+        try:
+            guardrails = derive_guardrails(
+                rows,
+                config=guardrail_config,
+                manifests=manifests,
+                runs=guardrail_runs,
+                seeds=seeds,
+                min_seeds=min_seeds,
+                seam_buffer=seam_buffer,
+                external_evidence=guardrail_evidence,
+            )
+        except ValueError as exc:
+            raise EvaluationError(f"guardrail evidence rejected: {exc}") from exc
     aggregate["gate"] = gate_verdict(
         aggregate, bootstrap_seed=bootstrap_seed, guardrails=guardrails)
     target = Path(output_json)

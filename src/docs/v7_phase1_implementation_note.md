@@ -139,7 +139,12 @@ bash src/scripts/v7/run_phase1_case_four_arms.sh
 # 4. All five cases, all events, >=3 seeds, all four arms; GPUs are pooled.
 bash src/scripts/v7/run_phase1_all.sh
 
-# 5. Generate per-frame RAFT evidence, score, merge and primary evaluation.
+# 5. Before generation, copy and review the threshold-only preregistration.
+# Do not fill thresholds after viewing Phase 1 outputs.
+cp src/pipeline/v7/phase1/guardrail_thresholds.template.json /reviewed/path/guardrails.json
+export PHASE1_GUARDRAIL_CONFIG=/reviewed/path/guardrails.json
+
+# 6. Generate per-frame RAFT evidence, score, merge and primary evaluation.
 # Optional when DEFAULT torchvision weights are not already cached:
 export RAFT_WEIGHTS_PATH=/path/to/raft_large_state_dict.pth
 bash src/scripts/v7/eval_phase1.sh
@@ -155,6 +160,61 @@ masked-DINO, RAFT-gated masked-DINO, full-frame DINO and SSIM. Missing,
 duplicate or mismatched RAFT tuple/frame evidence now fails before aggregation;
 GO additionally requires the declared RAFT threshold and every other
 guardrail to pass.
+
+### Guardrail evidence contract
+
+`PHASE1_GUARDRAIL_CONFIG` is threshold-only. Its exact canonical JSON is
+fingerprinted into every generation run as a matched invariant. The loader
+rejects `metric`, `value`, `passed`, unknown guardrail names, and any extra
+field. Therefore changing a threshold after generation makes aggregation fail
+instead of changing the verdict.
+
+Aggregation also requires the original `runs_index.json` and reloads every
+referenced `provenance.json`. For every score row, four fingerprints must be
+present and identical: the standalone score column, the score row's embedded
+`invariant_fingerprints.guardrail_config`, the validated generation provenance
+invariant, and the canonical fingerprint of the threshold file currently being
+used. Rewriting the threshold file and the standalone CSV column together is
+therefore still rejected.
+
+The five canonical guardrails are frozen in
+`pipeline/v7/phase1/guardrails.py`:
+
+- `raft_gated_anti_freeze` /
+  `correct_local_raft_drop_vs_global` (maximum allowed degradation);
+- `seam` / `seam_band_masked_dino_drop_v1` (maximum);
+- `non_support_quality` /
+  `non_support_masked_dino_drop_vs_global` (maximum);
+- `action_following` / `action_flow_error_v1` (maximum);
+- `copy_leakage` / `nonsupport_anchor_copy_similarity_v1` (maximum).
+
+RAFT and non-support values are recomputed from the scored per-frame table.
+RAFT CSV rows are additionally tied to the run fingerprint, manifest digest,
+generated-video digest and GT-reference digest. A JSON summary cannot override
+their value or pass/fail.
+
+Seam, action-following and copy/leakage require official per-frame evidence
+CSVs using the exact `EVIDENCE_COLUMNS` schema in `guardrails.py`. Their
+expected identities are built independently from formal
+`manifest × event × evaluation_seeds × four arms × region spec`: action follows
+all frames, copy/leakage follows non-support frames, and seam follows the
+deterministic planner boundary bands at `PHASE1_SEAM_BUFFER`. RAFT requires all
+frames and non-support quality requires every non-support frame. The expected
+sets are never inferred from whichever score/evidence rows happen to exist.
+Every required identity must occur exactly once and match the run fingerprint
+plus manifest/video/reference/mask digests. Deleting one frame, a whole tuple,
+or a whole region makes the guardrail `INCONCLUSIVE` (or rejects aggregation);
+producer name and version are mandatory. Supply the external artifacts as:
+
+```bash
+export PHASE1_GUARDRAIL_EVIDENCE_ROOT=/path/to/evidence
+# contains seam.csv, action_following.csv, copy_leakage.csv
+bash src/scripts/v7/eval_phase1.sh
+```
+
+Until all three complete identity-linked artifacts exist, the overall Gate is
+`INCONCLUSIVE` even when the primary statistics pass. It can never be `GO`
+from a handwritten summary JSON.
 
 Formal evaluation additionally requires, per case:
 
