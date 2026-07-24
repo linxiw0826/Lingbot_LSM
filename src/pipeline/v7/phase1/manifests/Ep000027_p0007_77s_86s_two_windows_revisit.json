@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "case_id": "Ep000027_p0007_77s_86s_two_windows_revisit",
+  "fps": 16,
+  "total_frames": 405,
+  "evaluation_seeds": null,
+  "first_visit": {"start": null, "end": null, "notes": "TODO: human annotation required"},
+  "revisit_events": [{
+    "event_id": "TODO_event_1",
+    "query_start": null,
+    "query_end": null,
+    "memory_frame_indices": [null],
+    "target_surface_id": null,
+    "wrong_anchor": null,
+    "notes": "TODO: annotate all revisit events and matched wrongs; do not run formal inference"
+  }],
+  "human_review": {"status": "TODO", "reviewer": null, "reviewed_at": null}
+}

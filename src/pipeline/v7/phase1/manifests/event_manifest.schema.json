@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "lingbot-v7-phase1-event-manifest-v1",
+  "title": "LingBot V7 Phase 1 event manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "case_id", "fps", "total_frames", "evaluation_seeds", "first_visit",
+    "revisit_events", "human_review"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "case_id": {"type": "string", "minLength": 1},
+    "fps": {"type": "integer", "minimum": 1},
+    "total_frames": {"type": "integer", "minimum": 1},
+    "evaluation_seeds": {
+      "description": "Authoritative preregistered seeds; TODO templates use null and formal validation rejects null.",
+      "type": ["array", "null"],
+      "minItems": 3,
+      "uniqueItems": true,
+      "items": {"type": "integer"}
+    },
+    "first_visit": {
+      "type": "object",
+      "required": ["start", "end", "notes"],
+      "properties": {
+        "start": {"type": ["integer", "null"]},
+        "end": {"type": ["integer", "null"]},
+        "notes": {"type": "string"}
+      }
+    },
+    "revisit_events": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "event_id", "query_start", "query_end", "memory_frame_indices", "notes"
+        ],
+        "properties": {
+          "event_id": {"type": "string", "minLength": 1},
+          "query_start": {"type": ["integer", "null"]},
+          "query_end": {"type": ["integer", "null"]},
+          "memory_frame_indices": {
+            "type": "array", "items": {"type": ["integer", "null"]}
+          },
+          "target_surface_id": {"type": ["string", "null"]},
+          "wrong_anchor": {"type": ["object", "null"]},
+          "notes": {"type": "string"}
+        }
+      }
+    },
+    "human_review": {
+      "type": "object",
+      "required": ["status", "reviewer", "reviewed_at"],
+      "properties": {
+        "status": {"enum": ["TODO", "approved"]},
+        "reviewer": {"type": ["string", "null"]},
+        "reviewed_at": {"type": ["string", "null"]}
+      }
+    }
+  }
+}
