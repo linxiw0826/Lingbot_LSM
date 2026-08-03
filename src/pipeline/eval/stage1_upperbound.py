@@ -119,12 +119,88 @@ import sys
 import tempfile
 from datetime import datetime
 from os.path import abspath, dirname, join
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 import torchvision.transforms.functional as TF
 from PIL import Image
+
+
+class RuntimeSpatialPlan(NamedTuple):
+    pixel_h: int
+    pixel_w: int
+    latent_h: int
+    latent_w: int
+
+
+def runtime_spatial_plan(
+    input_h: int,
+    input_w: int,
+    max_area: int,
+    vae_stride: Sequence[int],
+    patch_size: Sequence[int],
+) -> RuntimeSpatialPlan:
+    """Mirror WanI2V.generate spatial planning from runtime geometry."""
+    if input_h <= 0 or input_w <= 0:
+        raise ValueError(f"input H/W must be positive, got {(input_h, input_w)}")
+    if max_area <= 0:
+        raise ValueError(f"max_area must be positive, got {max_area!r}")
+    if len(vae_stride) < 3 or len(patch_size) < 3:
+        raise ValueError(
+            f"vae_stride and patch_size must have T/H/W, got "
+            f"{vae_stride!r} and {patch_size!r}")
+    stride_h, stride_w = int(vae_stride[-2]), int(vae_stride[-1])
+    patch_h, patch_w = int(patch_size[-2]), int(patch_size[-1])
+    if min(stride_h, stride_w, patch_h, patch_w) <= 0:
+        raise ValueError(
+            f"runtime stride/patch must be positive, got "
+            f"{vae_stride!r} and {patch_size!r}")
+
+    aspect = input_h / input_w
+    latent_h = round(
+        np.sqrt(max_area * aspect) // stride_h // patch_h * patch_h)
+    latent_w = round(
+        np.sqrt(max_area / aspect) // stride_w // patch_w * patch_w)
+    if latent_h <= 0 or latent_w <= 0:
+        raise ValueError(
+            f"runtime spatial plan is empty for input={(input_h, input_w)}, "
+            f"max_area={max_area}, stride={vae_stride!r}, patch={patch_size!r}")
+    return RuntimeSpatialPlan(
+        pixel_h=latent_h * stride_h,
+        pixel_w=latent_w * stride_w,
+        latent_h=latent_h,
+        latent_w=latent_w,
+    )
+
+
+def validate_anchor_latent_compatibility(
+    query_cond_latent,
+    anchor_latent,
+    plan: RuntimeSpatialPlan,
+) -> None:
+    """Fail before temporal concat when anchor/query spatial geometry differs."""
+    if anchor_latent is None:
+        return
+    query_shape = tuple(int(value) for value in query_cond_latent.shape)
+    anchor_shape = tuple(int(value) for value in anchor_latent.shape)
+    if len(query_shape) != 4 or len(anchor_shape) != 4:
+        raise ValueError(
+            f"query/anchor latents must be [C,T,H,W], got "
+            f"query={query_shape}, anchor={anchor_shape}, "
+            f"planned_pixel_hw={(plan.pixel_h, plan.pixel_w)}, "
+            f"planned_latent_hw={(plan.latent_h, plan.latent_w)}")
+    query_chw = (query_shape[0], query_shape[2], query_shape[3])
+    anchor_chw = (anchor_shape[0], anchor_shape[2], anchor_shape[3])
+    planned_hw = (plan.latent_h, plan.latent_w)
+    if (query_chw != anchor_chw
+            or query_shape[2:] != planned_hw
+            or anchor_shape[2:] != planned_hw):
+        raise ValueError(
+            f"anchor/query latent C/H/W mismatch before temporal concat: "
+            f"query={query_shape}, anchor={anchor_shape}, "
+            f"planned_pixel_hw={(plan.pixel_h, plan.pixel_w)}, "
+            f"planned_latent_hw={(plan.latent_h, plan.latent_w)}")
 
 
 # ---------------------------------------------------------------------------
@@ -470,7 +546,6 @@ def _generate_with_anchor(
     from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
     n_anchor = 0 if anchor_latent is None else int(anchor_latent.shape[1])
-    max_area = MAX_AREA_CONFIGS[args.size]
     vae_stride = wan_i2v.vae_stride          # (4, 8, 8)
     patch_size = wan_i2v.patch_size
     param_dtype = wan_i2v.param_dtype
@@ -479,13 +554,10 @@ def _generate_with_anchor(
     img = TF.to_tensor(query_first_img).sub_(0.5).div_(0.5).to(device)  # [3,H,W] in [-1,1]
     F_pix = args.frame_num
     h0, w0 = img.shape[1:]
-    aspect = h0 / w0
-    lat_h = round(np.sqrt(max_area * aspect) // vae_stride[1]
-                  // patch_size[1] * patch_size[1])
-    lat_w = round(np.sqrt(max_area / aspect) // vae_stride[2]
-                  // patch_size[2] * patch_size[2])
-    h = lat_h * vae_stride[1]
-    w = lat_w * vae_stride[2]
+    spatial_plan = runtime_spatial_plan(
+        int(h0), int(w0), MAX_AREA_CONFIGS[args.size], vae_stride, patch_size)
+    h, w = spatial_plan.pixel_h, spatial_plan.pixel_w
+    lat_h, lat_w = spatial_plan.latent_h, spatial_plan.latent_w
     lat_f_query = (F_pix - 1) // vae_stride[0] + 1
     lat_f_total = lat_f_query + n_anchor
 
@@ -584,6 +656,8 @@ def _generate_with_anchor(
 
     if n_anchor > 0:
         # anchor clean latent append 到 query cond latent 之后（时间维尾部）
+        validate_anchor_latent_compatibility(
+            query_cond_latent, anchor_latent, spatial_plan)
         anchor_lat = anchor_latent.to(query_cond_latent.dtype).to(device)  # [16,n_anchor,...]
         cond_latent = torch.cat([query_cond_latent, anchor_lat], dim=1)    # [16, lat_f_total, ...]
     else:
@@ -1181,16 +1255,10 @@ def _resize_w(height: int, width: int, args) -> int:
 
 def _resize_hw(height: int, width: int, args) -> Tuple[int, int]:
     from wan.configs import MAX_AREA_CONFIGS, WAN_CONFIGS
-    max_area = MAX_AREA_CONFIGS[args.size]
     cfg = WAN_CONFIGS["i2v-A14B"]
-    vae_stride = cfg.vae_stride
-    patch_size = cfg.patch_size
-    aspect = height / width
-    lat_h = round(np.sqrt(max_area * aspect) // vae_stride[1]
-                  // patch_size[1] * patch_size[1])
-    lat_w = round(np.sqrt(max_area / aspect) // vae_stride[2]
-                  // patch_size[2] * patch_size[2])
-    return lat_h * vae_stride[1], lat_w * vae_stride[2]
+    plan = runtime_spatial_plan(
+        height, width, MAX_AREA_CONFIGS[args.size], cfg.vae_stride, cfg.patch_size)
+    return plan.pixel_h, plan.pixel_w
 
 
 if __name__ == "__main__":

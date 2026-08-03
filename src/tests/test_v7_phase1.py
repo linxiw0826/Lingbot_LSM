@@ -45,7 +45,12 @@ from pipeline.v7.phase1.provenance import (
     validate_run_index_entry,
 )
 from pipeline.v7.phase1.raft import attach_raft_scores, validate_raft_scores
-from pipeline.v7.phase1.run import tokens_per_anchor_frame
+from pipeline.v7.phase1.run import _encode_anchor, tokens_per_anchor_frame
+from pipeline.eval.stage1_upperbound import (
+    RuntimeSpatialPlan,
+    runtime_spatial_plan,
+    validate_anchor_latent_compatibility,
+)
 
 
 def _manifest(case: str = "case0", total: int = 173):
@@ -178,6 +183,17 @@ def test_matched_four_arms_have_same_planner_support_and_budget():
         for window in job.windows:
             if not window.support:
                 assert not anchor_enabled(job, window) or job.arm == "global"
+
+
+def test_correct_local_routes_anchor_only_inside_support():
+    jobs = [job for job in build_matched_jobs(_manifest()) if job.seed == 42]
+    off = next(job for job in jobs if job.arm == "off")
+    correct = next(job for job in jobs if job.arm == "correct_local")
+    assert all(not anchor_enabled(off, window) for window in off.windows)
+    assert any(not window.support for window in correct.windows)
+    assert any(window.support for window in correct.windows)
+    assert all(anchor_enabled(correct, window) == window.support
+               for window in correct.windows)
 
 
 def _invariant_evidence():
@@ -688,6 +704,62 @@ def test_runtime_tokens_per_anchor_rejects_invalid_patch_size(patch_size):
     anchor = np.zeros((16, 1, 48, 80), dtype=np.float32)
     with pytest.raises(ValueError):
         tokens_per_anchor_frame(anchor, SimpleNamespace(patch_size=patch_size))
+
+
+def test_runtime_spatial_plan_matches_wan_generate_for_480x832():
+    plan = runtime_spatial_plan(
+        480, 832, 480 * 832, (4, 8, 8), (1, 2, 2))
+    assert plan == RuntimeSpatialPlan(
+        pixel_h=464, pixel_w=832, latent_h=58, latent_w=104)
+
+
+def test_anchor_encoder_uses_planned_pixel_hw(monkeypatch):
+    import torch
+    from pipeline.eval import stage1_upperbound
+
+    calls = []
+
+    def fake_encode(vae, frame, height, width, device):
+        calls.append((frame.copy(), height, width, device))
+        return torch.zeros((16, 1, height // 8, width // 8))
+
+    monkeypatch.setattr(stage1_upperbound, "_encode_anchor_latent", fake_encode)
+    rgb = np.zeros((3, 3, 4, 4), dtype=np.float32)
+    rgb[1] = 1
+    rgb[2] = 2
+    latent = _encode_anchor(
+        object(), rgb, [1, 2], (464, 832), "cpu")
+    assert latent.shape == (16, 2, 58, 104)
+    assert [(height, width) for _, height, width, _ in calls] == [
+        (464, 832), (464, 832)]
+    np.testing.assert_array_equal(calls[0][0], rgb[1])
+    np.testing.assert_array_equal(calls[1][0], rgb[2])
+
+
+def test_anchor_query_latent_compatibility_allows_different_time_lengths():
+    plan = RuntimeSpatialPlan(464, 832, 58, 104)
+    query = np.zeros((16, 21, 58, 104), dtype=np.float32)
+    anchor = np.zeros((16, 3, 58, 104), dtype=np.float32)
+    validate_anchor_latent_compatibility(query, anchor, plan)
+
+
+def test_anchor_query_latent_compatibility_fails_before_60_vs_58_concat():
+    plan = RuntimeSpatialPlan(464, 832, 58, 104)
+    query = np.zeros((16, 21, 58, 104), dtype=np.float32)
+    anchor = np.zeros((16, 3, 60, 104), dtype=np.float32)
+    with pytest.raises(ValueError, match="C/H/W mismatch") as error:
+        validate_anchor_latent_compatibility(query, anchor, plan)
+    message = str(error.value)
+    assert "query=(16, 21, 58, 104)" in message
+    assert "anchor=(16, 3, 60, 104)" in message
+    assert "planned_pixel_hw=(464, 832)" in message
+    assert "planned_latent_hw=(58, 104)" in message
+
+
+def test_off_anchor_skips_latent_compatibility_check():
+    plan = RuntimeSpatialPlan(464, 832, 58, 104)
+    query = np.zeros((16, 21, 58, 104), dtype=np.float32)
+    validate_anchor_latent_compatibility(query, None, plan)
 
 
 @pytest.mark.parametrize("field", [

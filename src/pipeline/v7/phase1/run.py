@@ -138,11 +138,17 @@ def _load_case(root: str, case_id: str, total_frames: int) -> Dict[str, Any]:
     return {**arrays, "first_image": first_image, "prompt": prompt, "case_dir": case}
 
 
-def _encode_anchor(vae, rgb: np.ndarray, frame_indices: List[int], size: str, device):
+def _encode_anchor(
+    vae,
+    rgb: np.ndarray,
+    frame_indices: List[int],
+    pixel_hw: tuple[int, int],
+    device,
+):
     import torch
     from pipeline.eval.stage1_upperbound import _encode_anchor_latent
 
-    height, width = (int(x) for x in size.split("*"))
+    height, width = pixel_hw
     pieces = [
         _encode_anchor_latent(vae, rgb[index], height, width, device)
         for index in frame_indices
@@ -261,9 +267,17 @@ def _run(args: argparse.Namespace) -> None:
     event_spec = next(
         event for event in manifest["revisit_events"] if event["event_id"] == job.event_id
     )
+    from pipeline.eval.stage1_upperbound import runtime_spatial_plan
+    from wan.configs import MAX_AREA_CONFIGS
+
+    input_h, input_w = (int(value) for value in data["rgb"].shape[-2:])
+    spatial_plan = runtime_spatial_plan(
+        input_h, input_w, MAX_AREA_CONFIGS[args.size],
+        pipeline.vae_stride, pipeline.patch_size)
+    planned_pixel_hw = (spatial_plan.pixel_h, spatial_plan.pixel_w)
     budget_indices = [int(value) for value in event_spec["memory_frame_indices"]]
     budget_anchor = _encode_anchor(
-        pipeline.vae, data["rgb"], budget_indices, args.size, device)
+        pipeline.vae, data["rgb"], budget_indices, planned_pixel_hw, device)
     correct_anchor = None
     anchor_poses = None
     if job.anchor_frame_indices:
@@ -271,7 +285,8 @@ def _run(args: argparse.Namespace) -> None:
             correct_anchor = budget_anchor
         else:
             correct_anchor = _encode_anchor(
-                pipeline.vae, source_data["rgb"], list(job.anchor_frame_indices), args.size, device)
+                pipeline.vae, source_data["rgb"], list(job.anchor_frame_indices),
+                planned_pixel_hw, device)
         anchor_poses = source_data["pose"][list(job.anchor_frame_indices)]
     generated_cache: Dict[int, np.ndarray] = {}
     window_outputs = []
