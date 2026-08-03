@@ -643,10 +643,51 @@ def test_raft_unavailable_is_explicit_and_makes_gate_inconclusive():
     assert gate_verdict(aggregate)["status"] == "INCONCLUSIVE"
 
 
-def test_runtime_tokens_per_anchor_uses_non_default_latent_and_patch_size():
+def test_runtime_tokens_per_anchor_uses_pipeline_patch_size():
+    anchor = np.zeros((16, 1, 48, 80), dtype=np.float32)
+    pipeline = SimpleNamespace(patch_size=(1, 2, 2))
+    assert tokens_per_anchor_frame(anchor, pipeline) == 24 * 40
+
+
+def test_runtime_tokens_per_anchor_falls_back_to_model_patch_size():
     anchor = np.zeros((16, 1, 48, 80), dtype=np.float32)
     pipeline = SimpleNamespace(model=SimpleNamespace(patch_size=(1, 4, 5)))
     assert tokens_per_anchor_frame(anchor, pipeline) == 12 * 16
+
+
+def test_runtime_tokens_per_anchor_accepts_integer_patch_size():
+    anchor = np.zeros((16, 1, 48, 80), dtype=np.float32)
+    assert tokens_per_anchor_frame(anchor, SimpleNamespace(patch_size=4)) == 12 * 20
+
+
+def test_runtime_tokens_per_anchor_prefers_pipeline_patch_size():
+    anchor = np.zeros((16, 1, 48, 80), dtype=np.float32)
+    pipeline = SimpleNamespace(
+        patch_size=[1, 2, 2],
+        model=SimpleNamespace(patch_size=(1, 3, 5)),
+    )
+    assert tokens_per_anchor_frame(anchor, pipeline) == 24 * 40
+
+
+def test_runtime_tokens_per_anchor_rejects_missing_patch_size():
+    anchor = np.zeros((16, 1, 48, 80), dtype=np.float32)
+    with pytest.raises(ValueError, match="cannot determine valid"):
+        tokens_per_anchor_frame(anchor, SimpleNamespace())
+
+
+def test_runtime_tokens_per_anchor_rejects_non_divisible_latent_shape():
+    anchor = np.zeros((16, 1, 47, 80), dtype=np.float32)
+    with pytest.raises(ValueError, match="not divisible"):
+        tokens_per_anchor_frame(anchor, SimpleNamespace(patch_size=(1, 2, 2)))
+
+
+@pytest.mark.parametrize("patch_size", [
+    0, -1, True, 2.0, "2", (), (2,), (1, 2, 2, 2), (1, 0, 2), (1, 2.0, 2),
+])
+def test_runtime_tokens_per_anchor_rejects_invalid_patch_size(patch_size):
+    anchor = np.zeros((16, 1, 48, 80), dtype=np.float32)
+    with pytest.raises(ValueError):
+        tokens_per_anchor_frame(anchor, SimpleNamespace(patch_size=patch_size))
 
 
 @pytest.mark.parametrize("field", [

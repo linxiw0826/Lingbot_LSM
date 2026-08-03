@@ -12,6 +12,7 @@ import logging
 import os
 import subprocess
 import sys
+from numbers import Integral
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List
@@ -154,17 +155,41 @@ def tokens_per_anchor_frame(anchor_latent: Any, pipeline: Any) -> int:
     shape = getattr(anchor_latent, "shape", None)
     if shape is None or len(shape) != 4:
         raise ValueError(f"anchor latent must be [C,T,H,W], got {shape}")
-    patch_size = getattr(getattr(pipeline, "model", None), "patch_size", None)
-    if patch_size is None:
-        patch_size = getattr(getattr(pipeline, "model", None), "patch", None)
-    if isinstance(patch_size, int):
-        patch_h = patch_w = patch_size
-    elif isinstance(patch_size, (tuple, list)) and len(patch_size) >= 2:
-        patch_h, patch_w = int(patch_size[-2]), int(patch_size[-1])
+
+    model = getattr(pipeline, "model", None)
+    candidates = (
+        ("pipeline.patch_size", getattr(pipeline, "patch_size", None)),
+        ("pipeline.model.patch_size", getattr(model, "patch_size", None)),
+        ("pipeline.patch", getattr(pipeline, "patch", None)),
+        ("pipeline.model.patch", getattr(model, "patch", None)),
+    )
+    source, patch_size = next(
+        ((name, value) for name, value in candidates if value is not None),
+        ("pipeline patch size", None),
+    )
+    if isinstance(patch_size, Integral) and not isinstance(patch_size, bool):
+        patch_values = (int(patch_size), int(patch_size))
+    elif isinstance(patch_size, (tuple, list)) and len(patch_size) in {2, 3}:
+        if any(not isinstance(value, Integral) or isinstance(value, bool)
+               for value in patch_size):
+            raise ValueError(
+                f"{source} must contain only integers, got {patch_size!r}")
+        patch_values = tuple(int(value) for value in patch_size)
     else:
-        raise ValueError(f"cannot determine pipeline spatial patch_size: {patch_size!r}")
+        raise ValueError(
+            f"cannot determine valid pipeline spatial patch_size from "
+            f"{source}: {patch_size!r}")
+    if any(value <= 0 for value in patch_values):
+        raise ValueError(f"{source} must contain only positive values, got {patch_size!r}")
+    patch_h, patch_w = patch_values[-2:]
+
+    if any(not isinstance(value, Integral) or isinstance(value, bool)
+           for value in shape[-2:]):
+        raise ValueError(f"anchor latent H/W must be integers, got {shape[-2:]}")
     latent_h, latent_w = int(shape[-2]), int(shape[-1])
-    if patch_h <= 0 or patch_w <= 0 or latent_h % patch_h or latent_w % patch_w:
+    if latent_h <= 0 or latent_w <= 0:
+        raise ValueError(f"anchor latent H/W must be positive, got {(latent_h, latent_w)}")
+    if latent_h % patch_h or latent_w % patch_w:
         raise ValueError(
             f"latent {(latent_h, latent_w)} is not divisible by patch {(patch_h, patch_w)}")
     return (latent_h // patch_h) * (latent_w // patch_w)
