@@ -14,7 +14,8 @@ DEV_EVAL_ROOT="${DEV_EVAL_ROOT:-${PHASE1_DEV_INPUT_ROOT}/dev_eval}"
 DINO_DEVICE="${DINO_DEVICE:-cpu}"
 
 cd "${REPO_ROOT}"
-test "$(git rev-parse HEAD)" = "${PHASE1_SHA}"
+EVALUATOR_SHA="$(git rev-parse HEAD)"
+test -z "$(git status --short --untracked-files=no)"
 
 PYTHONPATH=src python src/pipeline/v7/phase1/dev_eval.py \
   --input-root "${PHASE1_DEV_INPUT_ROOT}" \
@@ -22,6 +23,7 @@ PYTHONPATH=src python src/pipeline/v7/phase1/dev_eval.py \
   --cases-root "${CASES_ROOT}" \
   --manifest "${PHASE1_MANIFEST_DIR}/${CASE_ID}.json" \
   --commit-sha "${PHASE1_SHA}" \
+  --evaluator-commit-sha "${EVALUATOR_SHA}" \
   --case-id "${CASE_ID}" \
   --event-id "${EVENT_ID}" \
   --seed "${SEED}" \

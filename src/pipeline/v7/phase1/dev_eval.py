@@ -35,6 +35,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--cases-root", required=True, type=Path)
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--commit-sha", required=True)
+    parser.add_argument("--evaluator-commit-sha", required=True)
     parser.add_argument("--case-id", required=True)
     parser.add_argument("--event-id", required=True)
     parser.add_argument("--seed", required=True, type=int)
@@ -296,7 +297,9 @@ def main() -> None:
         else: verdict = "DEV_MIXED"
     summary = {
         "markers": list(MARKERS), "verdict": verdict, "dino": dino_status,
-        "identity": {"commit_sha": args.commit_sha, "case_id": args.case_id,
+        "identity": {"run_commit_sha": args.commit_sha,
+                     "evaluator_commit_sha": args.evaluator_commit_sha,
+                     "case_id": args.case_id,
                      "event_id": args.event_id, "seed": args.seed, "arms": list(ARMS)},
         "intervals_half_open": {"support": list(support), "first_visit": list(first_visit),
                                 "non_support": [[0, support[0]], [support[1], total]]},
@@ -308,7 +311,7 @@ def main() -> None:
     _json_dump(args.output_dir / "provenance_snapshot.json", {arm: runs[arm] for arm in ARMS})
     lines = ["# Phase 1 one-case three-arm dev quantitative diagnostic", "",
              "> " + " · ".join(MARKERS), "", f"**Verdict: `{verdict}`**", "",
-             f"- Identity: `{args.case_id}` / `{args.event_id}` / seed `{args.seed}` / commit `{args.commit_sha}`",
+             f"- Identity: `{args.case_id}` / `{args.event_id}` / seed `{args.seed}` / run commit `{args.commit_sha}` / evaluator commit `{args.evaluator_commit_sha}`",
              f"- Intervals (half-open): support `{support}`, first_visit `{first_visit}`",
              f"- Alignment: GT {tuple(gt_raw.shape[1:3])} center-cropped by {crop} to {(target_h, target_w)}; generated not resized",
              f"- DINO: `{dino_status['status']}` — {dino_status.get('reason', 'offline cache used')}", "",
