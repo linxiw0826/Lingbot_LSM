@@ -12,6 +12,7 @@ esac
 REPO_ROOT="${REPO_ROOT:-/mnt/nas/wlx/Memory/projects/Lingbot_LSM}"
 PILOT_ROOT="${PILOT_ROOT:-/mnt/nas/wlx/Memory/outputs/phase1_three_arm_pilot_20260803}"
 DEV_ROOT="${DEV_ROOT:-/mnt/nas/wlx/Memory/outputs/phase1_arch_return_40step_20260804}"
+WHEEL_DIR="${WHEEL_DIR:-/mnt/nas/wlx/wheels}"
 
 export CASES_ROOT="${CASES_ROOT:-/mnt/h20/135/Memory-world/inference_data/revisit_ep027_manual_v2_5clip_selected}"
 export CKPT_DIR="${CKPT_DIR:-/mnt/h20/135/lingbot-models/lingbot-world-base-act}"
@@ -33,6 +34,33 @@ cd "${REPO_ROOT}"
 test -d .git
 test -z "$(git status --short --untracked-files=no)"
 export PHASE1_SHA="$(git rev-parse HEAD)"
+
+# DLC images are not guaranteed to include OpenCV. Use only the preregistered
+# wheel staged on shared NAS; never resolve or download a package at job time.
+if ! python -c 'import cv2' >/dev/null 2>&1; then
+  shopt -s nullglob
+  opencv_wheels=("${WHEEL_DIR}"/opencv_python_headless-4.11.0.86-*.whl)
+  shopt -u nullglob
+  if [ "${#opencv_wheels[@]}" -ne 1 ]; then
+    echo "[ERROR] cv2 is missing and expected exactly one pinned wheel under ${WHEEL_DIR}; found ${#opencv_wheels[@]}" >&2
+    exit 4
+  fi
+  echo "Installing pinned offline OpenCV wheel: ${opencv_wheels[0]}"
+  python -m pip install --no-deps "${opencv_wheels[0]}"
+fi
+
+python - <<'PY'
+import cv2
+import numpy
+import torch
+
+print("opencv=", cv2.__version__)
+print("numpy=", numpy.__version__)
+print("torch=", torch.__version__)
+print("cuda=", torch.cuda.is_available())
+assert torch.cuda.is_available(), "CUDA is unavailable"
+print("RUNTIME_PREFLIGHT=PASS")
+PY
 
 MANIFEST="${PHASE1_MANIFEST_DIR}/${CASE_ID}.json"
 OUT="${PHASE1_OUTPUT_ROOT}/phase1/${PHASE1_SHA}/${ARM}/${CASE_ID}/${EVENT_ID}/seed_${SEED}"
@@ -107,4 +135,3 @@ print("resolution=", f"{width}x{height}")
 print("anchor_uses=", provenance["cumulative_anchor_frame_uses"])
 print("ARCH_RETURN_40STEP_ARM=PASS")
 PY
-
