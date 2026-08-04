@@ -49,8 +49,28 @@ if ! python -c 'import cv2' >/dev/null 2>&1; then
   python -m pip install --no-deps "${opencv_wheels[0]}"
 fi
 
+# Keep the DLC base CUDA stack intact. Install only small pure-Python/runtime
+# packages that are absent, with exact versions and without dependency
+# resolution (which could otherwise upgrade torch/numpy/transformers).
+ensure_pinned_import() {
+  local module="$1"
+  local requirement="$2"
+  if ! python -c "import ${module}" >/dev/null 2>&1; then
+    echo "Installing pinned missing runtime dependency: ${requirement}"
+    python -m pip install --no-deps "${requirement}"
+  fi
+}
+ensure_pinned_import easydict easydict==1.13
+ensure_pinned_import ftfy ftfy==6.3.1
+ensure_pinned_import imageio imageio==2.37.0
+ensure_pinned_import imageio_ffmpeg imageio-ffmpeg==0.6.0
+
 python - <<'PY'
 import cv2
+import easydict
+import ftfy
+import imageio
+import imageio_ffmpeg
 import numpy
 import torch
 
@@ -60,6 +80,13 @@ print("torch=", torch.__version__)
 print("cuda=", torch.cuda.is_available())
 assert torch.cuda.is_available(), "CUDA is unavailable"
 print("RUNTIME_PREFLIGHT=PASS")
+PY
+
+# Exercise the exact import that previously failed before spending minutes
+# loading T5/VAE/DiT checkpoint shards.
+PYTHONPATH="${REPO_ROOT}/refs/lingbot-world:${REPO_ROOT}/src" python - <<'PY'
+from wan.image2video import WanI2V  # noqa: F401
+print("WAN_IMPORT_PREFLIGHT=PASS")
 PY
 
 MANIFEST="${PHASE1_MANIFEST_DIR}/${CASE_ID}.json"
