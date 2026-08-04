@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# One-case/one-seed Phase 1 development run. This is intentionally separate
-# from the formal five-case/four-arm runner.
+# One-case/one-seed Phase 1 development worker. This is intentionally separate
+# from the formal five-case/four-arm runner. Case-specific wrappers may
+# override CASE_ID, EVENT_ID, manifest/cases roots, and DEV_ROOT.
 : "${ARM:?export ARM=off|global|correct_local}"
 case "${ARM}" in
   off|global|correct_local) ;;
@@ -26,9 +27,9 @@ export PHASE1_STEPS=40
 export PHASE1_SEAM_BUFFER="${PHASE1_SEAM_BUFFER:-8}"
 export LORA_PATH="${LORA_PATH:-}"
 
-export CASE_ID=Ep000027_p0007_26s_35s_fwd_back_two_windows
-export EVENT_ID=arch_return
-export SEED=42
+export CASE_ID="${CASE_ID:-Ep000027_p0007_26s_35s_fwd_back_two_windows}"
+export EVENT_ID="${EVENT_ID:-arch_return}"
+export SEED="${SEED:-42}"
 
 cd "${REPO_ROOT}"
 test -d .git
@@ -163,5 +164,5 @@ print("frames=", frames)
 print("fps=", fps)
 print("resolution=", f"{width}x{height}")
 print("anchor_uses=", provenance["cumulative_anchor_frame_uses"])
-print("ARCH_RETURN_40STEP_ARM=PASS")
+print("PHASE1_DEV_40STEP_ARM=PASS")
 PY

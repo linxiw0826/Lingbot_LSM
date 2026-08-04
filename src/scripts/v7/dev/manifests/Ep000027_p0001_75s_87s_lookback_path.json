@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "case_id": "Ep000027_p0001_75s_87s_lookback_path",
+  "fps": 16,
+  "total_frames": 405,
+  "evaluation_seeds": [42, 43, 44],
+  "first_visit": {
+    "start": 0,
+    "end": 112,
+    "notes": "DEV NEGATIVE CONTROL ONLY: indoor tunnel/crates; not an approved strict revisit target."
+  },
+  "revisit_events": [
+    {
+      "event_id": "lookback_non_strict_probe",
+      "query_start": 176,
+      "query_end": 224,
+      "memory_frame_indices": [64, 80, 96],
+      "target_surface_id": "non_matching_indoor_tunnel_vs_outdoor_query",
+      "wrong_anchor": null,
+      "notes": "DEV NON-STRICT NEGATIVE CONTROL. Query shows outdoor door/tarp/courtyard rather than the indoor first-visit surface. The arm name correct_local is mechanical and must not be interpreted as semantically correct memory."
+    }
+  ],
+  "human_review": {
+    "status": "approved",
+    "reviewer": "lwu9_dev_negative_control",
+    "reviewed_at": "2026-08-04T00:00:00Z"
+  }
+}
