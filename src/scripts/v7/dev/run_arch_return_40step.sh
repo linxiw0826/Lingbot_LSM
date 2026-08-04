@@ -12,7 +12,6 @@ esac
 REPO_ROOT="${REPO_ROOT:-/mnt/nas/wlx/Memory/projects/Lingbot_LSM}"
 PILOT_ROOT="${PILOT_ROOT:-/mnt/nas/wlx/Memory/outputs/phase1_three_arm_pilot_20260803}"
 DEV_ROOT="${DEV_ROOT:-/mnt/nas/wlx/Memory/outputs/phase1_arch_return_40step_20260804}"
-WHEEL_DIR="${WHEEL_DIR:-/mnt/nas/wlx/wheels}"
 
 export CASES_ROOT="${CASES_ROOT:-/mnt/h20/135/Memory-world/inference_data/revisit_ep027_manual_v2_5clip_selected}"
 export CKPT_DIR="${CKPT_DIR:-/mnt/h20/135/lingbot-models/lingbot-world-base-act}"
@@ -35,51 +34,37 @@ test -d .git
 test -z "$(git status --short --untracked-files=no)"
 export PHASE1_SHA="$(git rev-parse HEAD)"
 
-# DLC images are not guaranteed to include OpenCV. Use only the preregistered
-# wheel staged on shared NAS; never resolve or download a package at job time.
-if ! python -c 'import cv2' >/dev/null 2>&1; then
-  shopt -s nullglob
-  opencv_wheels=("${WHEEL_DIR}"/opencv_python_headless-4.11.0.86-*.whl)
-  shopt -u nullglob
-  if [ "${#opencv_wheels[@]}" -ne 1 ]; then
-    echo "[ERROR] cv2 is missing and expected exactly one pinned wheel under ${WHEEL_DIR}; found ${#opencv_wheels[@]}" >&2
-    exit 4
-  fi
-  echo "Installing pinned offline OpenCV wheel: ${opencv_wheels[0]}"
-  python -m pip install --no-deps "${opencv_wheels[0]}"
-fi
-
-# Keep the DLC base CUDA stack intact. Install only small pure-Python/runtime
-# packages that are absent, with exact versions and without dependency
-# resolution (which could otherwise upgrade torch/numpy/transformers).
-ensure_pinned_import() {
-  local module="$1"
-  local requirement="$2"
-  if ! python -c "import ${module}" >/dev/null 2>&1; then
-    echo "Installing pinned missing runtime dependency: ${requirement}"
-    python -m pip install --no-deps "${requirement}"
-  fi
-}
-ensure_pinned_import easydict easydict==1.13
-ensure_pinned_import ftfy ftfy==6.3.1
-ensure_pinned_import imageio imageio==2.37.0
-ensure_pinned_import imageio_ffmpeg imageio-ffmpeg==0.6.0
-
+# The official DLC runbook pins the lab image below. Do not mutate a bare
+# PyTorch image package-by-package at job time: flash_attn is ABI-coupled to
+# torch/CUDA, and a partially reconstructed environment is not reproducible.
 python - <<'PY'
-import cv2
-import easydict
-import ftfy
-import imageio
-import imageio_ffmpeg
-import numpy
-import torch
+import importlib
 
-print("opencv=", cv2.__version__)
-print("numpy=", numpy.__version__)
-print("torch=", torch.__version__)
+modules = (
+    "torch", "torchvision", "cv2", "diffusers", "transformers",
+    "tokenizers", "accelerate", "safetensors", "easydict", "ftfy",
+    "imageio", "imageio_ffmpeg", "flash_attn",
+)
+missing = []
+loaded = {}
+for name in modules:
+    try:
+        loaded[name] = importlib.import_module(name)
+    except Exception as exc:
+        missing.append(f"{name}: {type(exc).__name__}: {exc}")
+if missing:
+    raise SystemExit(
+        "LINGBOT_RUNTIME_IMPORT_GATE=FAIL\n"
+        "Use DLC image yahaha-registry-vpc.cn-shanghai.cr.aliyuncs.com/"
+        "peking/world_model:test-only\n" + "\n".join(missing)
+    )
+
+torch = loaded["torch"]
+for name in modules:
+    print(f"{name}=", getattr(loaded[name], "__version__", "imported"))
 print("cuda=", torch.cuda.is_available())
 assert torch.cuda.is_available(), "CUDA is unavailable"
-print("RUNTIME_PREFLIGHT=PASS")
+print("LINGBOT_RUNTIME_IMPORT_GATE=PASS")
 PY
 
 # Exercise the exact import that previously failed before spending minutes
