@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export ARM=correct_local
+exec bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/run_arch_return_40step.sh"
