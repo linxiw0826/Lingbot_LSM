@@ -12,6 +12,7 @@ esac
 REPO_ROOT="${REPO_ROOT:-/mnt/nas/wlx/Memory/projects/Lingbot_LSM}"
 PILOT_ROOT="${PILOT_ROOT:-/mnt/nas/wlx/Memory/outputs/phase1_three_arm_pilot_20260803}"
 DEV_ROOT="${DEV_ROOT:-/mnt/nas/wlx/Memory/outputs/phase1_arch_return_40step_20260804}"
+WHEEL_DIR="${WHEEL_DIR:-/mnt/nas/wlx/wheels}"
 
 export CASES_ROOT="${CASES_ROOT:-/mnt/h20/135/Memory-world/inference_data/revisit_ep027_manual_v2_5clip_selected}"
 export CKPT_DIR="${CKPT_DIR:-/mnt/h20/135/lingbot-models/lingbot-world-base-act}"
@@ -34,9 +35,11 @@ test -d .git
 test -z "$(git status --short --untracked-files=no)"
 export PHASE1_SHA="$(git rev-parse HEAD)"
 
-# The official DLC runbook pins the lab image below. Do not mutate a bare
-# PyTorch image package-by-package at job time: flash_attn is ABI-coupled to
-# torch/CUDA, and a partially reconstructed environment is not reproducible.
+# The canonical image supplies the ABI-coupled torch/CUDA/flash-attn stack but
+# some task variants omit upper-layer Python packages. Probe the complete
+# runtime first. If needed, install only the pinned upper layer plus the staged
+# OpenCV wheel; never resolve torch, torchvision, flash-attn, or numpy here.
+runtime_probe() {
 python - <<'PY'
 import importlib
 
@@ -55,8 +58,7 @@ for name in modules:
 if missing:
     raise SystemExit(
         "LINGBOT_RUNTIME_IMPORT_GATE=FAIL\n"
-        "Use DLC image yahaha-registry-vpc.cn-shanghai.cr.aliyuncs.com/"
-        "peking/world_model:test-only\n" + "\n".join(missing)
+        + "\n".join(missing)
     )
 
 torch = loaded["torch"]
@@ -66,6 +68,22 @@ print("cuda=", torch.cuda.is_available())
 assert torch.cuda.is_available(), "CUDA is unavailable"
 print("LINGBOT_RUNTIME_IMPORT_GATE=PASS")
 PY
+}
+
+if ! runtime_probe; then
+  shopt -s nullglob
+  opencv_wheels=("${WHEEL_DIR}"/opencv_python_headless-4.11.0.86-*.whl)
+  shopt -u nullglob
+  if [ "${#opencv_wheels[@]}" -ne 1 ]; then
+    echo "[ERROR] expected exactly one pinned OpenCV wheel under ${WHEEL_DIR}; found ${#opencv_wheels[@]}" >&2
+    exit 4
+  fi
+  echo "Installing pinned Phase 1 upper-layer runtime"
+  python -m pip install \
+    "${opencv_wheels[0]}" \
+    --requirement "${REPO_ROOT}/src/scripts/v7/dev/requirements_arch_runtime.txt"
+  runtime_probe
+fi
 
 # Exercise the exact import that previously failed before spending minutes
 # loading T5/VAE/DiT checkpoint shards.

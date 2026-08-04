@@ -1,0 +1,14 @@
+# Phase 1 DLC upper-layer runtime only.
+# Deliberately excludes torch/torchvision/flash-attn/numpy: those are supplied
+# by the canonical CUDA image and must not be mutated at job startup.
+accelerate==1.1.1
+diffusers==0.31.0
+easydict==1.13
+ftfy==6.3.1
+huggingface-hub==0.30.2
+imageio==2.37.0
+imageio-ffmpeg==0.6.0
+sentencepiece==0.2.0
+tokenizers==0.21.1
+transformers==4.51.3
+
