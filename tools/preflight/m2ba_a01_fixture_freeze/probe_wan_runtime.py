@@ -361,6 +361,29 @@ def build_conditioning_only(pipeline: Any, image: Any, window: dict[str, np.ndar
     }
 
 
+def direct_forward_conditioning(prepared: dict[str, Any]) -> dict[str, Any]:
+    """Validate conditioning shapes and apply Wan's batch-list contract once.
+
+    ``build_conditioning_only`` intentionally returns the per-sample I2V
+    conditioning tensor as ``[C, F, H, W]``.  Wan's direct forward accepts a
+    batch as a Python list, so the list wrapper belongs here, not in the
+    conditioning builder (and the tensor must never be indexed to add it).
+    """
+    y = prepared["y"]
+    if getattr(y, "ndim", None) != 4:
+        raise RuntimeError(
+            f"conditioning y must be a single [C,F,H,W] tensor, got "
+            f"{type(y).__name__} shape={getattr(y, 'shape', None)}"
+        )
+    context = prepared["context"]
+    if not isinstance(context, list) or len(context) != 1:
+        raise RuntimeError("conditioning context must already be a one-sample list")
+    dit_cond_dict = prepared["dit_cond_dict"]
+    if not isinstance(dit_cond_dict, dict):
+        raise RuntimeError("dit_cond_dict must be a mapping")
+    return {"context": context, "y": [y], "dit_cond_dict": dit_cond_dict}
+
+
 def validate_static(frozen: dict[str, Any], fingerprints: dict[str, Any], repo: Path) -> dict[str, Any]:
     errors = []
     if frozen.get("status") != "BLOCKED_MINIMAL_FORWARD_API_MISSING":
@@ -485,7 +508,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             mode="trilinear", align_corners=False,
         ).squeeze(0)
     x0 = pipeline.vae.encode([clean.to(device)])[0]
-    y = prepared["y"][0]
+    forward_conditioning = direct_forward_conditioning(prepared)
+    y = prepared["y"]
     if tuple(x0.shape) != EXPECTED_X0:
         raise RuntimeError(f"x0 shape drift: {tuple(x0.shape)} != {EXPECTED_X0}")
     if tuple(y.shape) != EXPECTED_Y:
@@ -551,9 +575,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 active["repeat"] = repeat
                 try:
                     result = model(
-                        [x0], t=t0, context=prepared["context"],
-                        seq_len=prepared["max_seq_len"], y=[y],
-                        dit_cond_dict=prepared["dit_cond_dict"],
+                        [x0], t=t0, context=forward_conditioning["context"],
+                        seq_len=prepared["max_seq_len"], y=forward_conditioning["y"],
+                        dit_cond_dict=forward_conditioning["dit_cond_dict"],
                     )[0]
                 except HookContractError:
                     raise

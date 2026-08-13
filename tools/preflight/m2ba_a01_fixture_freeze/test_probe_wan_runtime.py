@@ -6,11 +6,33 @@ from pathlib import Path
 
 from probe_wan_runtime import (
     CleanT0Unsupported, causal_latent_index, map_fixture_frames,
-    raise_runtime_stage_error, runtime_decision, token_slice_for_frame,
+    direct_forward_conditioning, raise_runtime_stage_error, runtime_decision,
+    token_slice_for_frame,
 )
 
 
 class RuntimeProbePureTests(unittest.TestCase):
+    def test_conditioning_y_keeps_channel_axis_and_is_wrapped_once(self):
+        import torch
+
+        y = torch.zeros(20, 21, 58, 104)
+        context_item = torch.zeros(3, 4)
+        plucker = torch.zeros(1, 6, 21, 58, 104)
+        prepared = {
+            "y": y,
+            "context": [context_item],
+            "dit_cond_dict": {"c2ws_plucker_emb": (plucker,)},
+        }
+
+        forward = direct_forward_conditioning(prepared)
+
+        self.assertEqual(tuple(prepared["y"].shape), (20, 21, 58, 104))
+        self.assertIs(forward["context"], prepared["context"])
+        self.assertEqual(len(forward["y"]), 1)
+        self.assertIs(forward["y"][0], y)
+        self.assertEqual(tuple(forward["y"][0].shape), (20, 21, 58, 104))
+        self.assertIs(forward["dit_cond_dict"], prepared["dit_cond_dict"])
+
     def test_causal_mapping_for_frozen_target(self):
         self.assertEqual(causal_latent_index(70, 4, 21), 18)
         self.assertEqual(causal_latent_index(0, 4, 21), 0)
