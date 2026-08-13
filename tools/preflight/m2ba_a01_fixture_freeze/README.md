@@ -10,15 +10,23 @@ NAS pilot manifests, workspace pilot manifests, then repository dev manifests.
 Multiple paths with identical SHA256 are recorded as aliases of one logical
 manifest; differing contents remain a fail-closed ambiguity. Repository
 `src/pipeline/v7/phase1/manifests` null/TODO templates are never candidates.
-Positive TRAIN/DEV oracle fixtures require one selected memory frame. The
-EMPTY/REJECT safety fixture records its ordered manifest candidates but consumes
-no selected memory.
+Positive TRAIN/DEV oracle fixtures freeze the complete, unique, deterministic
+ordered `memory_frame_indices` set consumed by Phase 1. Every member must be an
+integer inside `first_visit` and strictly before `query_start`. The EMPTY/REJECT
+safety fixture records its ordered manifest candidates but consumes no selected
+memory set.
 
 Run from the repository on the execution server:
 
 ```bash
 bash /mnt/nas/wlx/Memory/projects/Lingbot_LSM/tools/preflight/m2ba_a01_fixture_freeze/run_probe.sh
 ```
+
+The shell runner is intentionally nonfatal and always returns `0`, including
+when a diagnostic gate fails. It prints `PROBE_PYTHON_EXIT=<code>` and records
+the same code in `logs/probe_exit_code.txt`; authoritative status remains in
+`frozen_fixture_manifest.json`, `probe_summary.md`, and the logs. Setup, copy,
+Python, and `tee` errors are printed rather than silently hidden.
 
 The current version intentionally does **not** load Wan or sample a video. The
 repository exposes a generation pipeline, but static inspection alone cannot
