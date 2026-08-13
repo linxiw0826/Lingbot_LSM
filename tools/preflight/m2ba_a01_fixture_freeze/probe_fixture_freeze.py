@@ -30,6 +30,42 @@ def cmd(args,cwd=None):
 def jload(p): return json.loads(p.read_text())
 def first_existing(xs): return [p for p in xs if p.is_file()]
 
+def resolve_manifest(cid:str, dirs:list[Path])->dict[str,Any]:
+ """Resolve path aliases by content, while failing closed on content conflicts."""
+ matches=[]; seen=set()
+ for path in first_existing([d/f'{cid}.json' for d in dirs]):
+  key=str(path)
+  if key not in seen: matches.append(path); seen.add(key)
+ groups:dict[str,list[Path]]={}
+ for path in matches: groups.setdefault(sha(path),[]).append(path)
+ result={
+  'candidate_paths':[str(x) for x in matches],
+  'content_groups':[{'sha256':digest,'paths':[str(x) for x in paths]}
+                    for digest,paths in groups.items()],
+  'selected_path':None,'selected_sha256':None,'alias_paths':[],
+  'status':'missing' if not matches else 'content_conflict',
+ }
+ if len(groups)==1:
+  digest,aliases=next(iter(groups.items()))
+  # matches already follows the explicit directory-priority order.
+  result.update(status='resolved',selected_path=str(aliases[0]),
+                selected_sha256=digest,alias_paths=[str(x) for x in aliases])
+ return result
+
+def resolve_memory(role:str, frames:Any)->dict[str,Any]:
+ values=list(frames) if isinstance(frames,list) else []
+ if role=='EMPTY_REJECT_SAFETY':
+  return {'candidate_full_frames':values,'selected_full_frame':None,
+          'selection_status':'not_consumed',
+          'selection_reason':'not consumed by empty/reject fixture','valid':True}
+ valid=len(values)==1 and isinstance(values[0],int)
+ return {'candidate_full_frames':values,
+         'selected_full_frame':values[0] if valid else None,
+         'selection_status':'selected' if valid else 'ambiguous',
+         'selection_reason':'unique positive-oracle manifest memory frame' if valid else
+                            'positive oracle fixture requires exactly one integer memory frame',
+         'valid':valid}
+
 def source_contract(repo:Path):
  out={'status':'STATIC_ONLY','evidence':{},'unresolved':[]}
  files={'model':repo/'refs/lingbot-world/wan/modules/model.py','config':repo/'refs/lingbot-world/wan/configs/wan_i2v_A14B.py','run':repo/'src/pipeline/v7/phase1/run.py'}
@@ -80,20 +116,35 @@ def main():
   import torch
   env.update(torch_version=torch.__version__,cuda_available=torch.cuda.is_available(),cuda_devices=[torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())])
  except Exception as e: env['torch_error']=repr(e)
- mdirs=[Path(x) for x in (a.manifest_dir or [])]+[Path('/mnt/nas/wlx/Memory/outputs/phase1_three_arm_pilot_20260803/manifests'),Path('/mnt/workspace/wlx/Memory/outputs/phase1_three_arm_pilot_20260803/manifests')]
+ # Authority order is explicit. src/pipeline/v7/phase1/manifests is intentionally
+ # excluded because it contains null/TODO templates, not runnable fixtures.
+ mdirs=[Path(x) for x in (a.manifest_dir or [])]+[
+  Path('/mnt/nas/wlx/Memory/outputs/phase1_three_arm_pilot_20260803/manifests'),
+  Path('/mnt/workspace/wlx/Memory/outputs/phase1_three_arm_pilot_20260803/manifests'),
+  repo/'src/scripts/v7/dev/manifests',
+ ]
  prov_roots=[Path('/mnt/nas/wlx/Memory/outputs'),Path('/mnt/workspace/wlx/Memory/outputs')]
  provs=[]
  for root in prov_roots:
   if root.is_dir(): provs.extend(root.rglob('provenance.json'))
  fixtures=[]
  for role,cid,eid,expected in FIXTURES:
-  matches=first_existing([d/f'{cid}.json' for d in mdirs])
-  f={'role':role,'case_id':cid,'event_id':eid,'candidate_support_half_open':list(expected),'manifest_candidates':[str(x) for x in matches],'validation':{}}
-  if len(matches)!=1:
-   ambiguities.append({'fixture':cid,'kind':'manifest_resolution','candidates':[str(x) for x in matches]}); unresolved.append(f'{cid}:manifest_not_unique');fixtures.append(f);continue
-  mp=matches[0]; m=jload(mp); ev=[x for x in m.get('revisit_events',[]) if x.get('event_id')==eid]
+  resolution=resolve_manifest(cid,mdirs)
+  f={'role':role,'case_id':cid,'event_id':eid,'candidate_support_half_open':list(expected),
+     'manifest_candidates':resolution['candidate_paths'],
+     'manifest_alias_paths':resolution['alias_paths'],
+     'manifest_content_groups':resolution['content_groups'],
+     'manifest_selected_path':resolution['selected_path'],
+     'manifest_selected_sha256':resolution['selected_sha256'],'validation':{}}
+  if resolution['status']!='resolved':
+   kind='manifest_missing' if resolution['status']=='missing' else 'manifest_content_conflict'
+   ambiguities.append({'fixture':cid,'kind':kind,'candidates':resolution['candidate_paths'],
+                       'content_groups':resolution['content_groups']})
+   unresolved.append(f'{cid}:{kind}');fixtures.append(f);continue
+  mp=Path(resolution['selected_path']); m=jload(mp); ev=[x for x in m.get('revisit_events',[]) if x.get('event_id')==eid]
   if len(ev)!=1: unresolved.append(f'{cid}:event_not_unique');fixtures.append(f);continue
   e=ev[0]; support=(e.get('query_start'),e.get('query_end')); first=m.get('first_visit',{}); target=(support[0]+support[1]-1)//2 if all(isinstance(x,int) for x in support) and support[0]<support[1] else None
+  memory=resolve_memory(role,e.get('memory_frame_indices'))
   case=cases/cid; inputs=[]
   for n in ('poses.npy','action.npy','intrinsics.npy','ground_truth_full.mp4','prompt.txt','image.jpg','image.png'):
    p=case/n
@@ -105,9 +156,9 @@ def main():
   if len(owners)==1:
    inds=owners[0]['source_frame_index']; local=[i for i,x in enumerate(inds) if x==target]
   pv=select_prov(provs,(cid,eid)); selected=pv[0][3] if pv else None
-  f.update(manifest_path=str(mp),manifest_sha256=sha(mp),total_frames=m.get('total_frames'),fps=m.get('fps'),support_full_half_open=list(support),first_visit_full_half_open=[first.get('start'),first.get('end')],target_full_frame=target,memory_full_frames=e.get('memory_frame_indices'),memory_source='manifest.revisit_events[].memory_frame_indices',input_paths=[str(x) for x in inputs],planner_windows=plans,target_window_id=owners[0]['window_index'] if len(owners)==1 else None,target_window_local_indices=local,provenance_candidates=[x[2] for x in pv],selected_provenance_path=pv[0][2] if pv else None,selected_provenance=selected,frame_to_token_mapping={'status':'BLOCKED_GPU_RUNTIME','reason':'requires actual VAE/model hidden runtime shape'},validation={'support_matches_candidate':support==expected,'target_inside_support':target is not None and support[0]<=target<support[1],'manifest_unique':True,'event_unique':True,'memory_unique':len(e.get('memory_frame_indices',[]))==1,'inputs_required_present':all((case/n).is_file() for n in ('poses.npy','action.npy','intrinsics.npy','ground_truth_full.mp4'))})
+  f.update(manifest_path=str(mp),manifest_sha256=resolution['selected_sha256'],total_frames=m.get('total_frames'),fps=m.get('fps'),support_full_half_open=list(support),first_visit_full_half_open=[first.get('start'),first.get('end')],target_full_frame=target,memory_candidate_full_frames=memory['candidate_full_frames'],memory_selected_full_frame=memory['selected_full_frame'],memory_selection_status=memory['selection_status'],memory_selection_reason=memory['selection_reason'],memory_source='manifest.revisit_events[].memory_frame_indices',input_paths=[str(x) for x in inputs],planner_windows=plans,target_window_id=owners[0]['window_index'] if len(owners)==1 else None,target_window_local_indices=local,provenance_candidates=[x[2] for x in pv],selected_provenance_path=pv[0][2] if pv else None,selected_provenance=selected,frame_to_token_mapping={'status':'BLOCKED_GPU_RUNTIME','reason':'requires actual VAE/model hidden runtime shape'},validation={'support_matches_candidate':support==expected,'target_inside_support':target is not None and support[0]<=target<support[1],'manifest_unique_logical_content':True,'manifest_alias_count':len(resolution['alias_paths']),'event_unique':True,'memory_contract_valid':memory['valid'],'inputs_required_present':all((case/n).is_file() for n in ('poses.npy','action.npy','intrinsics.npy','ground_truth_full.mp4'))})
   if support!=expected: unresolved.append(f'{cid}:support_candidate_mismatch')
-  if len(e.get('memory_frame_indices',[]))!=1: unresolved.append(f'{cid}:memory_frame_not_unique')
+  if not memory['valid']: unresolved.append(f'{cid}:memory_frame_not_unique')
   fixtures.append(f)
  # checkpoint inventory, content hashes only for small metadata/config files
  inv=[]
@@ -124,7 +175,7 @@ def main():
  frozen={'schema_version':'m2ba_a01_fixture_freeze_v1','status':status,'generated_at_utc':utc(),'repo':str(repo),'repo_commit':env.get('git_head'),'repo_dirty_preexisting':bool(env.get('git_status_short')),'cases_root':str(cases),'checkpoint_root':str(ckpt),'checkpoint_fingerprint_kind':'stable_inventory(path,bytes,mtime_ns)+small_config_sha256','checkpoint_fingerprint':ckfp,'environment':env,'fixtures':fixtures,'unresolved':unresolved,'blockers':[runtime['status']]}
  dump(out/'frozen_fixture_manifest.json',frozen);dump(out/'runtime_contract.json',runtime);dump(out/'file_fingerprints.json',{'inputs':fps,'checkpoint_inventory':inv,'checkpoint_fingerprint':ckfp});dump(out/'ambiguities.json',{'items':ambiguities})
  summary=f"""# M2-B-A A0/A1 fixture freeze probe\n\n- Final status: `{status}`\n- FIXTURE_STATIC_GATE: `{'PASS' if static_ok else 'FAIL'}`\n- WAN_RUNTIME_CONTRACT_GATE: `BLOCKED`\n- Repository: `{repo}` @ `{env.get('git_head','')}`\n- Checkpoint fingerprint ({frozen['checkpoint_fingerprint_kind']}): `{ckfp}`\n\n## Fixtures\n\n"""
- for x in fixtures: summary+=f"- {x['role']}: `{x['case_id']}` / `{x['event_id']}`; support={x.get('support_full_half_open')}; memory={x.get('memory_full_frames')}; target={x.get('target_full_frame')}; window={x.get('target_window_id')}; local={x.get('target_window_local_indices')}\n"
+ for x in fixtures: summary+=f"- {x['role']}: `{x['case_id']}` / `{x['event_id']}`; support={x.get('support_full_half_open')}; memory_candidates={x.get('memory_candidate_full_frames')}; memory_selected={x.get('memory_selected_full_frame')}; target={x.get('target_full_frame')}; window={x.get('target_window_id')}; local={x.get('target_window_local_indices')}\n"
  summary+="\n## Runtime blocker\n\n"+runtime['reason']+"\n\nNo repository, data, manifest, checkpoint, or existing Phase 1 output was modified.\n"
  atomic(out/'probe_summary.md',summary)
  generated=['frozen_fixture_manifest.json','runtime_contract.json','file_fingerprints.json','ambiguities.json','probe_summary.md']
