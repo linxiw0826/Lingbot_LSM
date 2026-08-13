@@ -23,14 +23,47 @@ bash /mnt/nas/wlx/Memory/projects/Lingbot_LSM/tools/preflight/m2ba_a01_fixture_f
 ```
 
 The shell runner is intentionally nonfatal and always returns `0`, including
-when a diagnostic gate fails. It prints `PROBE_PYTHON_EXIT=<code>` and records
-the same code in `logs/probe_exit_code.txt`; authoritative status remains in
+when a diagnostic gate fails. It prints `STATIC_PROBE_PYTHON_EXIT=<code>` and
+`RUNTIME_PROBE_PYTHON_EXIT=<code>` and records them in the corresponding exit
+code logs; authoritative status remains in
 `frozen_fixture_manifest.json`, `probe_summary.md`, and the logs. Setup, copy,
 Python, and `tee` errors are printed rather than silently hidden.
 
-The current version intentionally does **not** load Wan or sample a video. The
-repository exposes a generation pipeline, but static inspection alone cannot
-prove a minimal clean-`t=0` teacher forward, pre-head runtime shape, determinism,
-or exact full-frame-to-token mapping. It therefore reports
-`BLOCKED_MINIMAL_FORWARD_API_MISSING` after a successful static gate rather than
-inventing runtime evidence. A separately reviewed runtime hook probe is required.
+After the static gate passes, `probe_wan_runtime.py` loads the real raw WanI2V
+pipeline and performs exactly two identical direct calls to
+`low_noise_model.forward` on the TRAIN fixture window. It uses clean VAE `x0`,
+`t=torch.zeros(1)`, the real I2V `y`, text context, Plucker/action condition and
+runtime spatial plan. It never enters a scheduler sampling loop, decodes a VAE
+latent, writes a video, enables gradients, or trains.
+
+The conditioning-only builder uses the lower-level Wan text/VAE/camera/action
+components directly and never constructs a scheduler, RNG, random noise, or
+low-noise surrogate. Expert selection is made through the real
+`pipeline._prepare_model_for_timestep(t=0,
+boundary=pipeline.boundary*pipeline.num_train_timesteps,
+offload_model=True)` API and must return the identical `low_noise_model` object.
+The historical `0.947*1000` value is recorded only as an observation comparison;
+it is never used as runtime authority.
+
+Forward-pre-hooks on `low_noise_model.blocks[0]` and `low_noise_model.head`
+record full tensor metadata and only the target latent-frame's 1508-token slice.
+The probe validates `[16,21,58,104]` x0, `[20,21,58,104]` y, `[1,L,5120]`
+hidden layout, causal `latent_t=ceil(local_frame/4)`, finite values, repeated
+bf16 determinism (`atol=rtol=2e-3`), and no base-state mutation. Model-state
+checking inventories every parameter/buffer identity, shape, dtype, device and
+PyTorch version counter, supplemented by deterministic first/middle/last content
+samples. It also explicitly inventories Wan's unregistered plain tensor
+`model.freqs`, after its expected device placement and before both measured
+forwards. This avoids hashing roughly 28 GB twice and is explicitly not
+described as a full cryptographic weight hash. Determinism covers both target
+block-0/pre-head slices and the full direct-forward output latent.
+
+On PASS, every frozen fixture target receives a full-frame → planner-window-local
+→ causal-latent → token-slice mapping, and TRAIN additionally records every
+support frame plus deduplicated many-to-one groups and boundaries. This mapping
+is explicitly labelled a causal receptive-field assignment derived from the
+planner, VAE stride and patch size—not empirical feature attribution.
+
+Both diagnostic stages are nonfatal at the shell level. The runner always exits
+zero and prints `STATIC_PROBE_PYTHON_EXIT` and `RUNTIME_PROBE_PYTHON_EXIT`; the
+JSON status and logs remain authoritative.

@@ -32,10 +32,27 @@ python "$SCRIPT_DIR/probe_fixture_freeze.py" --repo "$REPO" --cases "$CASES" --c
 pipeline_status=("${PIPESTATUS[@]}")
 probe_python_exit="${pipeline_status[0]:-127}"
 probe_tee_exit="${pipeline_status[1]:-127}"
-echo "PROBE_PYTHON_EXIT=$probe_python_exit"
+echo "STATIC_PROBE_PYTHON_EXIT=$probe_python_exit"
 if [ "$probe_tee_exit" -ne 0 ]; then echo "PROBE_TEE_EXIT=$probe_tee_exit" >&2; fi
 printf '%s\n' "$probe_python_exit" > "$PROBE_OUT/logs/probe_exit_code.txt"
 write_exit_rc=$?
 if [ "$write_exit_rc" -ne 0 ]; then echo "PROBE_EXIT_CODE_LOG_WRITE_ERROR=$write_exit_rc" >&2; fi
+
+cp "$SCRIPT_DIR/probe_wan_runtime.py" "$PROBE_OUT/scripts/probe_wan_runtime.py"
+copy_runtime_rc=$?
+if [ "$copy_runtime_rc" -ne 0 ]; then echo "PROBE_COPY_RUNTIME_ERROR=$copy_runtime_rc" >&2; fi
+
+runtime_python_exit=3
+if [ "$probe_python_exit" -eq 0 ] && [ "$copy_runtime_rc" -eq 0 ]; then
+  python "$SCRIPT_DIR/probe_wan_runtime.py" --repo "$REPO" --output "$PROBE_OUT" --device "${PROBE_DEVICE:-cuda:0}" 2>&1 | tee "$PROBE_OUT/logs/runtime_probe.log"
+  runtime_pipeline_status=("${PIPESTATUS[@]}")
+  runtime_python_exit="${runtime_pipeline_status[0]:-127}"
+  runtime_tee_exit="${runtime_pipeline_status[1]:-127}"
+  if [ "$runtime_tee_exit" -ne 0 ]; then echo "RUNTIME_PROBE_TEE_EXIT=$runtime_tee_exit" >&2; fi
+else
+  printf '%s\n' "Runtime probe skipped because FIXTURE_STATIC_GATE did not pass or runtime script copy failed." | tee "$PROBE_OUT/logs/runtime_probe.log"
+fi
+echo "RUNTIME_PROBE_PYTHON_EXIT=$runtime_python_exit"
+printf '%s\n' "$runtime_python_exit" > "$PROBE_OUT/logs/runtime_probe_exit_code.txt"
 
 exit 0
