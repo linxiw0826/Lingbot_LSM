@@ -14,8 +14,21 @@ memory_module — Surprise-Driven Memory Bank for LingBot-World
 
 from .memory_bank import MemoryBank, MemoryFrame
 from .nfp_head import NFPHead
+from .causal_memory_adapter import (
+    CausalMemoryAdapter,
+    CausalMemoryAdapterConfig,
+    WanCausalMemoryAdapterHooks,
+    expected_trainable_inventory,
+    tensor_module_fingerprint,
+)
 
-__all__ = ['MemoryBank', 'MemoryFrame', 'NFPHead']
+__all__ = [
+    'MemoryBank', 'MemoryFrame', 'NFPHead',
+    'CausalMemoryAdapter', 'CausalMemoryAdapterConfig',
+    'WanCausalMemoryAdapterHooks',
+    'expected_trainable_inventory',
+    'tensor_module_fingerprint',
+]
 
 try:
     from .memory_attention import MemoryCrossAttention
