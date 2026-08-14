@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -193,6 +194,27 @@ def dump(path: Path, value: Any) -> None:
     os.replace(temporary, path)
 
 
+class ProbeProgress:
+    """Atomically persist the last reached stage for postmortem diagnostics."""
+
+    def __init__(self, path: Path, report: dict[str, Any]) -> None:
+        self.path = path
+        self.report = report
+
+    def mark(self, stage: str, **evidence: Any) -> None:
+        self.report["stage"] = stage
+        self.report.setdefault("stage_evidence", {}).update(evidence)
+        dump(self.path, self.report)
+
+    def append(self, stage: str, history_key: str, item: dict[str, Any]) -> None:
+        self.report["stage"] = stage
+        history = self.report.setdefault("stage_evidence", {}).setdefault(
+            history_key, []
+        )
+        history.append(item)
+        dump(self.path, self.report)
+
+
 def tensor_record(value: torch.Tensor) -> dict[str, Any]:
     cpu = value.detach().float().cpu().contiguous()
     return {
@@ -239,11 +261,16 @@ def main() -> int:
         "repo_commit": subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, text=True, capture_output=True).stdout.strip(),
         "scope": "A0_ONLY_NO_TRAINING", "cpu_test_exit": args.cpu_test_exit,
     }
+    report_path = output / "a0_parity_report.json"
+    progress = ProbeProgress(report_path, report)
+    progress.mark("START")
     try:
+        progress.mark("CPU_TEST_GATE")
         if args.cpu_test_exit != 0:
             raise RuntimeError(f"BLOCKED_CPU_TESTS: exit={args.cpu_test_exit}")
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA unavailable")
+        progress.mark("IMPORT_RUNTIME_MODULES")
         from memory_module.causal_memory_adapter import CausalMemoryAdapter, CausalMemoryAdapterConfig, WanCausalMemoryAdapterHooks, expected_trainable_inventory, tensor_module_fingerprint
         from pipeline.eval.stage1_upperbound import runtime_spatial_plan
         from pipeline.v6.latentconcat_infer import _load_raw_pipeline
@@ -257,13 +284,16 @@ def main() -> int:
         state_inventory = fixture_probe.state_inventory
         _frame_to_pil = fixture_probe._frame_to_pil
 
+        progress.mark("LOAD_FROZEN_FIXTURE_FILES")
         frozen = json.loads((Path(args.fixture_output) / "frozen_fixture_manifest.json").read_text())
         runtime = json.loads((Path(args.fixture_output) / "runtime_contract.json").read_text())
         if frozen.get("status") != "FIXTURE_FREEZE_PASS" or runtime.get("status") != "PASS":
             raise RuntimeError("frozen TRAIN fixture/runtime contract is not PASS")
+        progress.mark("VALIDATE_FROZEN_TRAIN_SCHEMA")
         fixture, selected_memory_frames = select_unique_train_fixture(frozen)
         mapping = fixture["frame_to_token_mapping"]
         device = torch.device(args.device)
+        progress.mark("LOAD_CASE_AND_PLAN", selected_memory_frames=selected_memory_frames)
         data = _load_case(frozen["cases_root"], fixture["case_id"], int(fixture["total_frames"]))
         plans = plan_windows(int(fixture["total_frames"]), tuple(fixture["support_full_half_open"]), context_frames=81, seam_buffer=8)
         plan = plans[int(fixture["target_window_id"])]
@@ -274,7 +304,13 @@ def main() -> int:
             size="480*832", frame_num=81, num_inference_steps=40,
             sample_shift=10.0, guide_scale=5.0, prompt=data["prompt"], seed=42,
         )
+        progress.mark("LOAD_RAW_PIPELINE")
         pipeline = _load_raw_pipeline(generation_args, device)
+        progress.mark(
+            "SELECT_T0_MODEL",
+            pipeline_param_dtype=str(pipeline.param_dtype),
+            vae_stride=list(pipeline.vae_stride), patch_size=list(pipeline.patch_size),
+        )
         boundary = float(pipeline.boundary) * float(pipeline.num_train_timesteps)
         model = pipeline._prepare_model_for_timestep(torch.tensor(0.0, device=device), boundary, offload_model=True)
         if model is not pipeline.low_noise_model:
@@ -283,12 +319,20 @@ def main() -> int:
         model.freqs = model.freqs.to(device)
         input_h, input_w = map(int, window["rgb"].shape[-2:])
         spatial = runtime_spatial_plan(input_h, input_w, MAX_AREA_CONFIGS[generation_args.size], pipeline.vae_stride, pipeline.patch_size)
+        progress.mark(
+            "BUILD_CONDITIONING",
+            window_rgb_shape=list(window["rgb"].shape),
+            planned_pixel_hw=[spatial.pixel_h, spatial.pixel_w],
+            planned_latent_hw=[spatial.latent_h, spatial.latent_w],
+        )
         prepared = build_conditioning_only(pipeline, _frame_to_pil(window["rgb"][0]), window, data["prompt"], spatial, device)
         forward_conditioning = direct_forward_conditioning(prepared)
         clean = torch.from_numpy(np.ascontiguousarray(window["rgb"])).float().permute(1, 0, 2, 3)
         if clean.shape[-2:] != (spatial.pixel_h, spatial.pixel_w):
             clean = torch.nn.functional.interpolate(clean.unsqueeze(0), size=(clean.shape[1], spatial.pixel_h, spatial.pixel_w), mode="trilinear", align_corners=False).squeeze(0)
+        progress.mark("ENCODE_QUERY_WINDOW", clean_query_shape=list(clean.shape))
         x0 = pipeline.vae.encode([clean.to(device)])[0]
+        progress.mark("QUERY_WINDOW_ENCODED", x0_shape=list(x0.shape), x0_dtype=str(x0.dtype))
         target = mapping["target"]
         token_slice = slice(int(target["token_start"]), int(target["token_end"]))
 
@@ -297,7 +341,38 @@ def main() -> int:
             frame = torch.from_numpy(np.ascontiguousarray(data["rgb"][frame_index])).float().unsqueeze(1)
             if frame.shape[-2:] != (spatial.pixel_h, spatial.pixel_w):
                 frame = torch.nn.functional.interpolate(frame.unsqueeze(0), size=(1, spatial.pixel_h, spatial.pixel_w), mode="trilinear", align_corners=False).squeeze(0)
-            selected_latents.append(pipeline.vae.encode([frame.to(device)])[0])
+            progress.mark(
+                "ENCODE_MEMORY_FRAME", memory_frame_index=frame_index,
+                memory_pixel_tensor_shape=list(frame.shape),
+                encoded_memory_count=len(selected_latents),
+            )
+            encoded_frame = pipeline.vae.encode([frame.to(device)])[0]
+            encoded_record = {
+                "frame_index": frame_index,
+                "shape": list(encoded_frame.shape),
+                "dtype": str(encoded_frame.dtype),
+                "device": str(encoded_frame.device),
+                "finite": bool(torch.isfinite(encoded_frame.float()).all().item()),
+            }
+            progress.append(
+                "MEMORY_FRAME_ENCODED", "memory_vae_outputs", encoded_record
+            )
+            if tuple(encoded_frame.shape) != (16, 1, 58, 104):
+                raise RuntimeError(
+                    f"memory frame {frame_index} VAE output must be exact "
+                    f"[16,1,58,104], got {tuple(encoded_frame.shape)}"
+                )
+            if not encoded_record["finite"]:
+                raise RuntimeError(f"memory frame {frame_index} VAE output is non-finite")
+            selected_latents.append(encoded_frame)
+        memory_history = report.get("stage_evidence", {}).get("memory_vae_outputs", [])
+        if (
+            len(selected_latents) != 3
+            or len(memory_history) != 3
+            or [item["frame_index"] for item in memory_history] != selected_memory_frames
+            or any(item["shape"] != [16, 1, 58, 104] for item in memory_history)
+        ):
+            raise RuntimeError("memory VAE output history is incomplete or drifted before cat")
         memory_latents = torch.cat(selected_latents, dim=1).unsqueeze(0)
         if tuple(memory_latents.shape) != (1, 16, 3, 58, 104):
             raise RuntimeError(f"memory latent shape drift: {tuple(memory_latents.shape)}")
@@ -313,11 +388,15 @@ def main() -> int:
         if int(route.sum()) != expected_nq:
             raise RuntimeError(f"route token count drift: {int(route.sum())} != {expected_nq}")
 
+        progress.mark("MEMORY_FRAMES_ENCODED", memory_latents_shape=list(memory_latents.shape))
         config = CausalMemoryAdapterConfig()
+        progress.mark("BASE_STATE_INVENTORY_BEFORE")
         base_before = state_inventory(model)
         cpu_rng_before = torch.random.get_rng_state().clone()
         cuda_rng_before = [state.clone() for state in torch.cuda.get_rng_state_all()]
+        progress.mark("CONSTRUCT_ADAPTER", base_state_digest=base_before["digest"])
         adapter = CausalMemoryAdapter.from_wan_self_attention(model.blocks[0].self_attn, config).to(device=device, dtype=torch.bfloat16).eval()
+        progress.mark("VALIDATE_ADAPTER_INITIAL_STATE")
         rng_preserved = torch.equal(cpu_rng_before, torch.random.get_rng_state()) and all(torch.equal(a, b) for a, b in zip(cuda_rng_before, torch.cuda.get_rng_state_all(), strict=True))
         kvo_clone_pass = all(
             torch.equal(adapter.state_dict()[adapter_name], model.state_dict()[base_name])
@@ -385,12 +464,15 @@ def main() -> int:
             }
 
         with torch.no_grad(), torch.amp.autocast("cuda", dtype=pipeline.param_dtype):
+            progress.mark("REAL_FORWARD_BASELINE")
             baseline = baseline_forward()
+            progress.mark("REAL_FORWARD_BYPASS_ARMS")
             bypass_runs = {
                 "disabled": wrapped_forward(memory_latents=None, route_query_mask=None, adapter_enabled=False),
                 "empty": wrapped_forward(memory_latents=None, route_query_mask=None),
                 "reject": wrapped_forward(memory_latents=torch.ones(1, device=device), route_query_mask=None, rejected=True),
             }
+            progress.mark("REAL_FORWARD_ENABLED")
             enabled = wrapped_forward(memory_latents=memory_latents, route_query_mask=route)
 
         bypass_comparisons = {
@@ -416,8 +498,10 @@ def main() -> int:
         diagnostics = enabled["diagnostics"]
         route_only = torch.count_nonzero(diagnostics["fused_delta"][~route]).item() == 0 and torch.count_nonzero(diagnostics["scattered_memory_delta"][~route]).item() == 0
         enabled_finite = all(record["finite"] for key, record in enabled.items() if key != "diagnostics") and all(torch.isfinite(t.float()).all() for t in (diagnostics["memory_tokens"], diagnostics["fused_delta"]))
+        progress.mark("FINGERPRINT_ADAPTER")
         adapter_fp = tensor_module_fingerprint(adapter)
         with tempfile.TemporaryDirectory(dir=output) as tmp:
+            progress.mark("CHECKPOINT_SAVE_LOAD")
             checkpoint = Path(tmp) / "adapter_state.pt"
             torch.save({
                 "config": config.canonical_dict(),
@@ -464,6 +548,7 @@ def main() -> int:
                 ),
             }
             del restored_disabled, restored_enabled, restored, payload
+        progress.mark("BASE_STATE_INVENTORY_AFTER")
         base_after = state_inventory(model)
         base_unchanged = base_before["digest"] == base_after["digest"]
         gates = {
@@ -499,10 +584,20 @@ def main() -> int:
             "gpu_peak_allocated_bytes": int(torch.cuda.max_memory_allocated(device)), "gpu_peak_reserved_bytes": int(torch.cuda.max_memory_reserved(device)),
             "note": "Candidate evidence only; this probe never declares A0 Gate PASS.",
         })
+        progress.mark("COMPLETE_CANDIDATE_REPORT")
     except Exception as exc:
         status = classify_probe_error(exc)
-        report.update({"status": status, "error": f"{type(exc).__name__}: {exc}", "note": "No PASS inferred. Review and rerun."})
-    dump(output / "a0_parity_report.json", report)
+        trace = traceback.format_exc()
+        report.update({
+            "status": status,
+            "error": f"{type(exc).__name__}: {exc}",
+            "traceback": trace,
+            "failed_stage": report.get("stage", "UNKNOWN"),
+            "note": "No PASS inferred. Review and rerun.",
+        })
+        print(trace, file=sys.stderr, flush=True)
+        progress.mark("FAILED", failure_origin_stage=report["failed_stage"])
+    dump(report_path, report)
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0
 

@@ -2,6 +2,7 @@ import importlib.util
 import sys
 import types
 import copy
+import json
 from pathlib import Path
 
 
@@ -204,3 +205,39 @@ def test_frozen_fixtures_must_be_list_and_unique_train_returns_authority():
     selected, memory = module.select_unique_train_fixture({"fixtures": [fixture]})
     assert selected is fixture
     assert memory == [96, 128, 176]
+
+
+def test_probe_progress_atomically_persists_stage(tmp_path):
+    module = _load_a0_probe()
+    report = {"status": "BLOCKED_GPU_RUNTIME"}
+    path = tmp_path / "a0_parity_report.json"
+    progress = module.ProbeProgress(path, report)
+    progress.mark("ENCODE_MEMORY_FRAME", memory_frame_index=96)
+    persisted = json.loads(path.read_text())
+    assert persisted["stage"] == "ENCODE_MEMORY_FRAME"
+    assert persisted["stage_evidence"]["memory_frame_index"] == 96
+
+
+def test_probe_progress_append_preserves_all_memory_vae_history(tmp_path):
+    module = _load_a0_probe()
+    report = {"status": "BLOCKED_GPU_RUNTIME"}
+    path = tmp_path / "a0_parity_report.json"
+    progress = module.ProbeProgress(path, report)
+    for frame_index in (96, 128, 176):
+        progress.append(
+            "MEMORY_FRAME_ENCODED",
+            "memory_vae_outputs",
+            {
+                "frame_index": frame_index,
+                "shape": [16, 1, 58, 104],
+                "dtype": "torch.bfloat16",
+                "device": "cuda:0",
+                "finite": True,
+            },
+        )
+    persisted = json.loads(path.read_text())
+    assert [
+        item["frame_index"]
+        for item in persisted["stage_evidence"]["memory_vae_outputs"]
+    ] == [96, 128, 176]
+    assert persisted["stage"] == "MEMORY_FRAME_ENCODED"
