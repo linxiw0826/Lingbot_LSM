@@ -229,7 +229,7 @@ class FakeWanBlock(nn.Module):
         self.modulation = nn.Parameter(torch.zeros(1, 6, dim))
         self.norm1 = nn.Identity()
 
-    def forward(self, x, e):
+    def forward(self, x, e=None):
         return x + 1
 
 
@@ -240,14 +240,14 @@ class FakeWan(nn.Module):
         self.head = nn.Identity()
 
     def forward(self, x, e):
-        return self.head(self.blocks[0](x, e))
+        return self.head(self.blocks[0](x, e=e))
 
 
 def test_real_hook_interface_bypass_and_enabled_route(fixture):
     cfg, _, adapter = fixture
     model = FakeWan()
     x = torch.randn(1, 6, cfg.hidden_dim)
-    e = torch.zeros(1, 1, 6, cfg.hidden_dim)
+    e = torch.zeros(1, 6, 6, cfg.hidden_dim)
     baseline = model(x, e)
     with WanCausalMemoryAdapterHooks(
         model, adapter, memory_latents=None, route_query_mask=None,
@@ -267,3 +267,44 @@ def test_real_hook_interface_bypass_and_enabled_route(fixture):
     assert torch.isfinite(enabled).all()
     assert hooks.adapter_diagnostics["physical_bypass"] is False
     assert hooks.pre_head_fused is not hooks.pre_head_input
+
+
+def test_wan_hook_rejects_positional_or_missing_e_and_unloads(fixture):
+    _, _, adapter = fixture
+    model = FakeWan()
+    x = torch.randn(1, 6, 24)
+    e = torch.zeros(1, 6, 6, 24, dtype=torch.float32)
+    hooks = WanCausalMemoryAdapterHooks(
+        model, adapter, memory_latents=None, route_query_mask=None,
+        adapter_enabled=False,
+    )
+    with pytest.raises(RuntimeError, match="exactly one positional"):
+        with hooks:
+            model.blocks[0](x, e)
+    assert hooks.handles == []
+    # Hook removal is real: the formerly invalid positional call now reaches
+    # the fake block normally.
+    assert torch.equal(model.blocks[0](x, e), x + 1)
+
+    with pytest.raises(RuntimeError, match="missing required keyword e"):
+        with WanCausalMemoryAdapterHooks(
+            model, adapter, memory_latents=None, route_query_mask=None,
+            adapter_enabled=False,
+        ):
+            model.blocks[0](x)
+
+
+def test_wan_hook_validates_keyword_e_shape_and_dtype(fixture):
+    _, _, adapter = fixture
+    model = FakeWan()
+    x = torch.randn(1, 6, 24)
+    for e, message in (
+        (torch.zeros(1, 1, 6, 24), r"must be \[B,L,6,D\]"),
+        (torch.zeros(1, 6, 6, 24, dtype=torch.bfloat16), "must be float32"),
+    ):
+        with pytest.raises(RuntimeError, match=message):
+            with WanCausalMemoryAdapterHooks(
+                model, adapter, memory_latents=None, route_query_mask=None,
+                adapter_enabled=False,
+            ):
+                model.blocks[0](x, e=e)

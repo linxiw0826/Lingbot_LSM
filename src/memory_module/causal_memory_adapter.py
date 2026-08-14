@@ -450,8 +450,24 @@ class WanCausalMemoryAdapterHooks(AbstractContextManager):
     def __enter__(self) -> "WanCausalMemoryAdapterHooks":
         block0 = self.model.blocks[0]
 
-        def block_pre_hook(_module, args):
-            x, e = args[0], args[1]
+        def block_pre_hook(_module, args, kwargs):
+            if len(args) != 1:
+                raise RuntimeError(
+                    "Wan block-0 hook requires exactly one positional arg x; "
+                    "e must be keyword-only at the model call-site"
+                )
+            if "e" not in kwargs:
+                raise RuntimeError("Wan block-0 hook missing required keyword e")
+            x, e = args[0], kwargs["e"]
+            if x.ndim != 3:
+                raise RuntimeError(f"Wan block-0 x must be [B,L,D], got {tuple(x.shape)}")
+            expected_e = (x.shape[0], x.shape[1], 6, x.shape[2])
+            if e.ndim != 4 or tuple(e.shape) != expected_e:
+                raise RuntimeError(
+                    f"Wan block-0 e must be [B,L,6,D]={expected_e}, got {tuple(e.shape)}"
+                )
+            if e.dtype != torch.float32:
+                raise RuntimeError(f"Wan block-0 e must be float32, got {e.dtype}")
             with torch.amp.autocast("cuda", dtype=torch.float32):
                 modulation = (_module.modulation.unsqueeze(0) + e).chunk(6, dim=2)
             self.h_sa0 = (
@@ -474,7 +490,7 @@ class WanCausalMemoryAdapterHooks(AbstractContextManager):
             return (fused, *args[1:])
 
         self.handles = [
-            block0.register_forward_pre_hook(block_pre_hook),
+            block0.register_forward_pre_hook(block_pre_hook, with_kwargs=True),
             block0.register_forward_hook(block_hook),
             self.model.head.register_forward_pre_hook(head_pre_hook),
         ]
