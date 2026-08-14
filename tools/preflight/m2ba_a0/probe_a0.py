@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import subprocess
@@ -17,6 +18,26 @@ from typing import Any
 
 import numpy as np
 import torch
+
+
+def load_fixture_probe_module(repo: Path):
+    """Load the sibling helper by verified repo path, never top-level ``tools``."""
+    expected = (
+        repo / "tools" / "preflight" / "m2ba_a01_fixture_freeze"
+        / "probe_wan_runtime.py"
+    ).resolve()
+    if not expected.is_file():
+        raise RuntimeError(f"fixture runtime helper missing: {expected}")
+    module_name = "_lingbot_lsm_m2ba_fixture_probe_wan_runtime"
+    spec = importlib.util.spec_from_file_location(module_name, expected)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot create import spec for fixture helper: {expected}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    loaded = Path(module.__file__).resolve()
+    if loaded != expected:
+        raise RuntimeError(f"fixture helper path mismatch: loaded={loaded} expected={expected}")
+    return module
 
 
 def utc_now() -> str:
@@ -86,8 +107,13 @@ def main() -> int:
         from pipeline.v6.latentconcat_infer import _load_raw_pipeline
         from pipeline.v7.phase1.planner import plan_windows, slice_modalities
         from pipeline.v7.phase1.run import _load_case
-        from tools.preflight.m2ba_a01_fixture_freeze.probe_wan_runtime import build_conditioning_only, direct_forward_conditioning, state_inventory, _frame_to_pil
         from wan.configs import MAX_AREA_CONFIGS
+
+        fixture_probe = load_fixture_probe_module(repo)
+        build_conditioning_only = fixture_probe.build_conditioning_only
+        direct_forward_conditioning = fixture_probe.direct_forward_conditioning
+        state_inventory = fixture_probe.state_inventory
+        _frame_to_pil = fixture_probe._frame_to_pil
 
         frozen = json.loads((Path(args.fixture_output) / "frozen_fixture_manifest.json").read_text())
         runtime = json.loads((Path(args.fixture_output) / "runtime_contract.json").read_text())
