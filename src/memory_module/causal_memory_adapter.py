@@ -511,6 +511,59 @@ class WanCausalMemoryAdapterHooks(AbstractContextManager):
         return False
 
 
+class WanA1MaskedTrainingHooks(WanCausalMemoryAdapterHooks):
+    """A1-only hook: zero all routed query tokens before block 0.
+
+    The normal generation integration continues to use
+    :class:`WanCausalMemoryAdapterHooks`; this subclass is exclusively for the
+    auxiliary hidden-reconstruction student pass.  It preserves positional and
+    condition tensor ``e`` and changes only visual query token values.
+    """
+
+    def __enter__(self) -> "WanA1MaskedTrainingHooks":
+        route = self.kwargs.get("route_query_mask")
+        if route is None or route.dtype != torch.bool:
+            raise TypeError("A1 student requires a boolean route_query_mask")
+        block0 = self.model.blocks[0]
+
+        def block_pre_hook(_module, args, kwargs):
+            if len(args) != 1 or "e" not in kwargs:
+                raise RuntimeError("Wan A1 block-0 call contract drift")
+            x, e = args[0], kwargs["e"]
+            if tuple(route.shape) != tuple(x.shape[:2]):
+                raise RuntimeError("A1 route/query token shape mismatch")
+            masked = x.clone()
+            masked[route] = 0
+            if torch.count_nonzero(masked[route]).item() != 0:
+                raise RuntimeError("A1 query shortcut mask is not exact zero")
+            self.block0_input = masked
+            modulation = (_module.modulation.unsqueeze(0) + e).chunk(6, dim=2)
+            self.h_sa0 = (
+                _module.norm1(masked).float() * (1 + modulation[1].squeeze(2))
+                + modulation[0].squeeze(2)
+            )
+            return (masked,), kwargs
+
+        def block_hook(_module, _args, output):
+            self.block0_output = output
+
+        def head_pre_hook(_module, args):
+            if self.h_sa0 is None:
+                raise RuntimeError("A1 block-0 query source was not captured")
+            self.pre_head_input = args[0]
+            fused, diagnostics = self.adapter(self.h_sa0, args[0], **self.kwargs)
+            self.pre_head_fused = fused
+            self.adapter_diagnostics = diagnostics
+            return (fused, *args[1:])
+
+        self.handles = [
+            block0.register_forward_pre_hook(block_pre_hook, with_kwargs=True),
+            block0.register_forward_hook(block_hook),
+            self.model.head.register_forward_pre_hook(head_pre_hook),
+        ]
+        return self
+
+
 def expected_trainable_inventory(
     config: CausalMemoryAdapterConfig,
     *,

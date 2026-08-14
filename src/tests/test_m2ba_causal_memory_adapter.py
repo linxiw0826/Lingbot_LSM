@@ -10,6 +10,7 @@ from memory_module.causal_memory_adapter import (
     CausalMemoryAdapterConfig,
     WanCompatibleRMSNorm,
     WanCausalMemoryAdapterHooks,
+    WanA1MaskedTrainingHooks,
     fixed_separable_position_encoding,
     expected_trainable_inventory,
     tensor_module_fingerprint,
@@ -333,6 +334,25 @@ def test_wan_hook_distinguishes_block_input_output_and_query_dtypes(fixture):
     assert hooks.h_sa0.dtype == torch.float32
     assert hooks.pre_head_input.dtype == torch.float32
     assert result.dtype == torch.float32
+
+
+def test_a1_training_hook_zeros_entire_route_before_block0(fixture):
+    cfg, _, adapter = fixture
+    model = FakeWan()
+    x = torch.randn(1, 6, cfg.hidden_dim)
+    e = torch.zeros(1, 6, 6, cfg.hidden_dim)
+    memory = torch.randn(
+        1, cfg.latent_channels, cfg.memory_frames,
+        cfg.latent_height, cfg.latent_width,
+    )
+    route = torch.tensor([[False, True, True, False, True, False]])
+    with WanA1MaskedTrainingHooks(
+        model, adapter, memory_latents=memory, route_query_mask=route,
+    ) as hooks:
+        model(x, e)
+    assert torch.count_nonzero(hooks.block0_input[route]).item() == 0
+    assert torch.equal(hooks.block0_input[~route], x[~route])
+    assert torch.count_nonzero(hooks.adapter_diagnostics["fused_delta"][~route]).item() == 0
 
 
 def test_wan_hook_rejects_positional_or_missing_e_and_unloads(fixture):
