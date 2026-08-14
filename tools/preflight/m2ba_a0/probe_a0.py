@@ -431,14 +431,22 @@ def main() -> int:
 
         def baseline_forward():
             captures = {}
-            def capture_block(_module, _args, out):
-                captures["block0"] = tensor_record(out[:, token_slice])
+            def capture_block_input(_module, args_, kwargs_):
+                if len(args_) != 1 or "e" not in kwargs_:
+                    raise RuntimeError("baseline block-0 pre-hook contract mismatch")
+                captures["block0_input"] = tensor_record(args_[0][:, token_slice])
+
+            def capture_block_output(_module, _args, out):
+                captures["block0_output"] = tensor_record(out[:, token_slice])
 
             def capture_head(_module, args_):
                 captures["pre_head_original"] = tensor_record(args_[0][:, token_slice])
 
             handles = [
-                model.blocks[0].register_forward_hook(capture_block),
+                model.blocks[0].register_forward_pre_hook(
+                    capture_block_input, with_kwargs=True
+                ),
+                model.blocks[0].register_forward_hook(capture_block_output),
                 model.head.register_forward_pre_hook(capture_head),
             ]
             try:
@@ -453,10 +461,16 @@ def main() -> int:
         def wrapped_forward(active_adapter=adapter, **kwargs):
             with WanCausalMemoryAdapterHooks(model, active_adapter, **kwargs) as hooks:
                 result = direct_forward()
-            if hooks.block0_output is None or hooks.pre_head_input is None or hooks.h_sa0 is None:
+            if (
+                hooks.block0_input is None
+                or hooks.block0_output is None
+                or hooks.pre_head_input is None
+                or hooks.h_sa0 is None
+            ):
                 raise RuntimeError("real Wan hook integration did not capture required tensors")
             return {
-                "block0": tensor_record(hooks.block0_output[:, token_slice]),
+                "block0_input": tensor_record(hooks.block0_input[:, token_slice]),
+                "block0_output": tensor_record(hooks.block0_output[:, token_slice]),
                 "pre_head_original": tensor_record(hooks.pre_head_input[:, token_slice]),
                 "pre_head_fused": tensor_record(hooks.pre_head_fused[:, token_slice]),
                 "query_source": tensor_record(hooks.h_sa0[:, token_slice]),
@@ -478,23 +492,38 @@ def main() -> int:
         bypass_comparisons = {
             name: {
                 field: comparison(baseline[field], value[field])
-                for field in ("block0", "pre_head_original", "pre_head_fused", "output")
+                for field in (
+                    "block0_input", "block0_output", "pre_head_original",
+                    "pre_head_fused", "output",
+                )
             }
             for name, value in bypass_runs.items()
         }
         bypass_pass = all(item["exact"] for run in bypass_comparisons.values() for item in run.values())
-        tensor_contract_pass = (
-            baseline["block0"]["shape"] == [1, 1508, 5120]
-            and baseline["pre_head_original"]["shape"] == [1, 1508, 5120]
-            and enabled["query_source"]["shape"] == [1, 1508, 5120]
-            and baseline["block0"]["dtype"] == "torch.bfloat16"
-            and baseline["pre_head_original"]["dtype"] == "torch.float32"
-            and all(
+        tensor_contract_checks = {
+            "baseline_block0_input_shape": baseline["block0_input"]["shape"] == [1, 1508, 5120],
+            "baseline_block0_output_shape": baseline["block0_output"]["shape"] == [1, 1508, 5120],
+            "baseline_pre_head_shape": baseline["pre_head_original"]["shape"] == [1, 1508, 5120],
+            "enabled_block0_input_shape": enabled["block0_input"]["shape"] == [1, 1508, 5120],
+            "enabled_block0_output_shape": enabled["block0_output"]["shape"] == [1, 1508, 5120],
+            "enabled_pre_head_original_shape": enabled["pre_head_original"]["shape"] == [1, 1508, 5120],
+            "enabled_pre_head_fused_shape": enabled["pre_head_fused"]["shape"] == [1, 1508, 5120],
+            "enabled_query_source_shape": enabled["query_source"]["shape"] == [1, 1508, 5120],
+            "baseline_block0_input_dtype_bfloat16": baseline["block0_input"]["dtype"] == "torch.bfloat16",
+            "baseline_block0_output_dtype_float32": baseline["block0_output"]["dtype"] == "torch.float32",
+            "baseline_pre_head_dtype_float32": baseline["pre_head_original"]["dtype"] == "torch.float32",
+            "enabled_block0_input_dtype_bfloat16": enabled["block0_input"]["dtype"] == "torch.bfloat16",
+            "enabled_block0_output_dtype_float32": enabled["block0_output"]["dtype"] == "torch.float32",
+            "enabled_pre_head_original_dtype_float32": enabled["pre_head_original"]["dtype"] == "torch.float32",
+            "enabled_pre_head_fused_dtype_float32": enabled["pre_head_fused"]["dtype"] == "torch.float32",
+            "enabled_query_source_dtype_float32": enabled["query_source"]["dtype"] == "torch.float32",
+            "all_records_cuda_and_finite": all(
                 record["device"].startswith("cuda") and record["finite"]
                 for collection in (baseline, enabled)
                 for key, record in collection.items() if key != "diagnostics"
-            )
-        )
+            ),
+        }
+        tensor_contract_pass = all(tensor_contract_checks.values())
         diagnostics = enabled["diagnostics"]
         route_only = torch.count_nonzero(diagnostics["fused_delta"][~route]).item() == 0 and torch.count_nonzero(diagnostics["scattered_memory_delta"][~route]).item() == 0
         enabled_finite = all(record["finite"] for key, record in enabled.items() if key != "diagnostics") and all(torch.isfinite(t.float()).all() for t in (diagnostics["memory_tokens"], diagnostics["fused_delta"]))
@@ -530,23 +559,24 @@ def main() -> int:
                 tensor_record(diagnostics["fused_delta"]),
                 tensor_record(restored_enabled["diagnostics"]["fused_delta"]),
             )
-            reload_pass = (
-                restored_config.fingerprint() == config.fingerprint()
-                and payload["config_fingerprint"] == restored_config.fingerprint()
-                and payload["trainable_inventory"] == expected_inventory
-                and restored.trainable_inventory() == expected_inventory
-                and tensor_module_fingerprint(restored) == adapter_fp
-                and reload_comparison["exact"]
-                and reload_delta_comparison["exact"]
-                and comparison(baseline["output"], restored_disabled["output"])["exact"]
-                and comparison(baseline["pre_head_fused"], restored_disabled["pre_head_fused"])["exact"]
-            )
             restored_disabled_comparison = {
                 "output": comparison(baseline["output"], restored_disabled["output"]),
                 "pre_head_fused": comparison(
                     baseline["pre_head_fused"], restored_disabled["pre_head_fused"]
                 ),
             }
+            reload_checks = {
+                "config_fingerprint_matches_live": restored_config.fingerprint() == config.fingerprint(),
+                "payload_config_fingerprint_matches": payload["config_fingerprint"] == restored_config.fingerprint(),
+                "payload_inventory_exact": payload["trainable_inventory"] == expected_inventory,
+                "restored_inventory_exact": restored.trainable_inventory() == expected_inventory,
+                "restored_state_fingerprint_exact": tensor_module_fingerprint(restored) == adapter_fp,
+                "enabled_output_exact": reload_comparison["exact"],
+                "enabled_delta_exact": reload_delta_comparison["exact"],
+                "disabled_output_exact": restored_disabled_comparison["output"]["exact"],
+                "disabled_pre_head_exact": restored_disabled_comparison["pre_head_fused"]["exact"],
+            }
+            reload_pass = all(reload_checks.values())
             del restored_disabled, restored_enabled, restored, payload
         progress.mark("BASE_STATE_INVENTORY_AFTER")
         base_after = state_inventory(model)
@@ -569,6 +599,8 @@ def main() -> int:
             "adapter_state_fingerprint": adapter_fp, "trainable_inventory": adapter.trainable_inventory(),
             "expected_trainable_inventory": expected_inventory,
             "trainable_inventory_summary": inventory_summary,
+            "tensor_contract_checks": tensor_contract_checks,
+            "reload_checks": reload_checks,
             "reload_enabled_output_comparison": reload_comparison,
             "reload_enabled_delta_comparison": reload_delta_comparison,
             "reload_disabled_comparison": restored_disabled_comparison,

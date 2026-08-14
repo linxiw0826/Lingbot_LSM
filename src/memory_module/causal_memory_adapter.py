@@ -222,6 +222,12 @@ class CausalMemoryAdapter(nn.Module):
         self.wv_mem = copy.deepcopy(base_self_attention.v)
         self.wo_mem = copy.deepcopy(base_self_attention.o)
         self.norm_k_mem = copy.deepcopy(base_self_attention.norm_k)
+        # The Wan backbone is frozen before adapter construction in the real
+        # A0 path.  deepcopy preserves requires_grad, so explicitly restore
+        # trainability for the adapter-owned K/V/O and norm-K clones without
+        # changing their values (or consuming RNG).
+        for module in (self.wk_mem, self.wv_mem, self.wo_mem, self.norm_k_mem):
+            module.requires_grad_(True)
         self.bridge = DetachedRMSBridge(config)
 
     @classmethod
@@ -444,6 +450,7 @@ class WanCausalMemoryAdapterHooks(AbstractContextManager):
         self.h_sa0: Optional[Tensor] = None
         self.pre_head_input: Optional[Tensor] = None
         self.pre_head_fused: Optional[Tensor] = None
+        self.block0_input: Optional[Tensor] = None
         self.block0_output: Optional[Tensor] = None
         self.adapter_diagnostics: Optional[Mapping[str, Tensor | bool]] = None
 
@@ -468,6 +475,7 @@ class WanCausalMemoryAdapterHooks(AbstractContextManager):
                 )
             if e.dtype != torch.float32:
                 raise RuntimeError(f"Wan block-0 e must be float32, got {e.dtype}")
+            self.block0_input = x
             with torch.amp.autocast("cuda", dtype=torch.float32):
                 modulation = (_module.modulation.unsqueeze(0) + e).chunk(6, dim=2)
             self.h_sa0 = (

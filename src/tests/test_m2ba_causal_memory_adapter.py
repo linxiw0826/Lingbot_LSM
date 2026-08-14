@@ -205,6 +205,43 @@ def test_trainable_inventory_exactly_matches_frozen_contract(fixture):
     )
 
 
+def test_fully_frozen_base_produces_exact_trainable_adapter_inventory_and_gradients():
+    torch.manual_seed(19)
+    cfg = CausalMemoryAdapterConfig(
+        latent_channels=4, memory_frames=3, latent_height=6, latent_width=8,
+        encoder_channels=8, pool_height=2, pool_width=2, hidden_dim=24, num_heads=3,
+    )
+    base = FakeSelfAttention().requires_grad_(False)
+    base_state = copy.deepcopy(base.state_dict())
+    adapter = CausalMemoryAdapter.from_wan_self_attention(base, cfg)
+
+    assert adapter.trainable_inventory() == expected_trainable_inventory(
+        cfg, dtype="torch.float32"
+    )
+    assert len(adapter.trainable_inventory()) == 17
+    assert all(not parameter.requires_grad for parameter in base.parameters())
+    assert all(
+        torch.equal(base_state[name], value)
+        for name, value in base.state_dict().items()
+    )
+
+    h = torch.randn(1, 5, cfg.hidden_dim)
+    memory = torch.randn(
+        1, cfg.latent_channels, cfg.memory_frames, cfg.latent_height, cfg.latent_width
+    )
+    route = torch.tensor([[False, True, True, False, False]])
+    adapter(h, h, memory_latents=memory, route_query_mask=route).float().sum().backward()
+
+    intended = dict(adapter.named_parameters())
+    assert set(intended) == {
+        item["name"]
+        for item in expected_trainable_inventory(cfg, dtype="torch.float32")
+    }
+    assert all(parameter.requires_grad for parameter in intended.values())
+    assert all(parameter.grad is not None for parameter in intended.values())
+    assert all(parameter.grad is None for parameter in base.parameters())
+
+
 def test_ragged_batch_route_masks_are_supported():
     cfg = CausalMemoryAdapterConfig(
         latent_channels=4, memory_frames=3, latent_height=6, latent_width=8,
@@ -243,6 +280,12 @@ class FakeWan(nn.Module):
         return self.head(self.blocks[0](x, e=e))
 
 
+class FakeWanFloat32Output(FakeWan):
+    def __init__(self):
+        super().__init__()
+        self.blocks[0].forward = lambda x, e=None: x.float() + 1
+
+
 def test_real_hook_interface_bypass_and_enabled_route(fixture):
     cfg, _, adapter = fixture
     model = FakeWan()
@@ -255,6 +298,9 @@ def test_real_hook_interface_bypass_and_enabled_route(fixture):
     ) as hooks:
         bypass = model(x, e)
     assert torch.equal(baseline, bypass)
+    assert hooks.block0_input is x
+    assert hooks.block0_output is not None
+    assert torch.equal(hooks.block0_output, x + 1)
     assert hooks.h_sa0 is not None and hooks.pre_head_input is not None
     assert hooks.pre_head_fused is hooks.pre_head_input
     memory = torch.randn(1, cfg.latent_channels, cfg.memory_frames, cfg.latent_height, cfg.latent_width)
@@ -265,8 +311,28 @@ def test_real_hook_interface_bypass_and_enabled_route(fixture):
         enabled = model(x, e)
     assert torch.equal(enabled[~route], baseline[~route])
     assert torch.isfinite(enabled).all()
+    assert hooks.block0_input is x
+    assert torch.equal(hooks.block0_output, x + 1)
     assert hooks.adapter_diagnostics["physical_bypass"] is False
     assert hooks.pre_head_fused is not hooks.pre_head_input
+
+
+def test_wan_hook_distinguishes_block_input_output_and_query_dtypes(fixture):
+    _, _, adapter = fixture
+    model = FakeWanFloat32Output()
+    x = torch.randn(1, 6, 24, dtype=torch.bfloat16)
+    e = torch.zeros(1, 6, 6, 24, dtype=torch.float32)
+    with WanCausalMemoryAdapterHooks(
+        model, adapter, memory_latents=None, route_query_mask=None,
+        adapter_enabled=False,
+    ) as hooks:
+        result = model(x, e)
+    assert hooks.block0_input is x
+    assert hooks.block0_input.dtype == torch.bfloat16
+    assert hooks.block0_output.dtype == torch.float32
+    assert hooks.h_sa0.dtype == torch.float32
+    assert hooks.pre_head_input.dtype == torch.float32
+    assert result.dtype == torch.float32
 
 
 def test_wan_hook_rejects_positional_or_missing_e_and_unloads(fixture):
