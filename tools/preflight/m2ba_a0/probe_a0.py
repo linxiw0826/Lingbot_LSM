@@ -40,6 +40,148 @@ def load_fixture_probe_module(repo: Path):
     return module
 
 
+def validate_train_fixture_schema(fixture: dict[str, Any]) -> list[int]:
+    """Fail closed on the frozen TRAIN schema; never accept summary aliases."""
+    if "memory_selected_set" in fixture:
+        raise RuntimeError(
+            "BLOCKED_FIXTURE_SCHEMA: forbidden summary alias memory_selected_set"
+        )
+    required = {
+        "role", "case_id", "event_id", "total_frames",
+        "support_full_half_open", "target_full_frame", "target_window_id",
+        "target_window_local_indices", "memory_selected_full_frames",
+        "frame_to_token_mapping", "planner_windows",
+    }
+    missing = sorted(required - fixture.keys())
+    if missing:
+        raise RuntimeError(f"BLOCKED_FIXTURE_SCHEMA: missing fields {missing}")
+    memory = fixture["memory_selected_full_frames"]
+    if (
+        fixture["role"] != "TRAIN"
+        or fixture["case_id"] != "Ep000027_p0007_77s_86s_two_windows_revisit"
+        or fixture["event_id"] != "side_alley_return"
+        or fixture["total_frames"] != 405
+        or fixture["support_full_half_open"] != [280, 405]
+        or fixture["target_full_frame"] != 342
+        or fixture["target_window_id"] != 5
+        or fixture["target_window_local_indices"] != [70]
+        or memory != [96, 128, 176]
+        or any(type(value) is not int for value in memory)
+    ):
+        raise RuntimeError(
+            "BLOCKED_FIXTURE_SCHEMA: frozen TRAIN identity/memory frames drift"
+        )
+    mapping = fixture["frame_to_token_mapping"]
+    if not isinstance(mapping, dict) or mapping.get("status") != "PASS" or not mapping.get("complete"):
+        raise RuntimeError("BLOCKED_FIXTURE_SCHEMA: frame_to_token_mapping is not complete PASS")
+    if not isinstance(mapping.get("target"), dict) or not isinstance(
+        mapping.get("deduplicated_many_to_one_groups"), list
+    ):
+        raise RuntimeError("BLOCKED_FIXTURE_SCHEMA: target/support token mappings missing")
+    expected_plans = []
+    capacity = 81 - 2 * 8
+    for segment_start, segment_end, support in ((0, 280, False), (280, 405, True)):
+        cursor = segment_start
+        while cursor < segment_end:
+            owned_end = min(segment_end, cursor + capacity)
+            source_start = min(max(0, cursor - 8), 405 - 81)
+            source = list(range(source_start, source_start + 81))
+            expected_plans.append({
+                "window_index": len(expected_plans),
+                "source_frame_index": source,
+                "owned_half_open": [cursor, owned_end],
+                "support": support,
+            })
+            cursor = owned_end
+    actual_plans = fixture["planner_windows"]
+    if actual_plans != expected_plans:
+        raise RuntimeError("BLOCKED_FIXTURE_SCHEMA: planner_windows drift")
+
+    expected_rows = []
+    for full_frame in range(280, 405):
+        owners = [
+            plan for plan in expected_plans
+            if plan["owned_half_open"][0] <= full_frame < plan["owned_half_open"][1]
+        ]
+        if len(owners) != 1:
+            raise RuntimeError("BLOCKED_FIXTURE_SCHEMA: canonical support ownership invalid")
+        plan = owners[0]
+        locals_ = [
+            index for index, source in enumerate(plan["source_frame_index"])
+            if source == full_frame
+        ]
+        if len(locals_) != 1:
+            raise RuntimeError("BLOCKED_FIXTURE_SCHEMA: canonical local mapping invalid")
+        local = locals_[0]
+        latent_t = (local + 3) // 4
+        expected_rows.append({
+            "full_frame": full_frame,
+            "window_id": plan["window_index"],
+            "local_frame": local,
+            "latent_t": latent_t,
+            "patch_t": latent_t,
+            "token_start": latent_t * 1508,
+            "token_end": (latent_t + 1) * 1508,
+            "token_count": 1508,
+        })
+    groups: dict[tuple[int, int, int, int], list[int]] = {}
+    for row in expected_rows:
+        key = (row["window_id"], row["latent_t"], row["token_start"], row["token_end"])
+        groups.setdefault(key, []).append(row["full_frame"])
+    expected_groups = [
+        {
+            "window_id": key[0], "latent_t": key[1],
+            "token_start": key[2], "token_end": key[3],
+            "full_frames": frames,
+            "full_frame_half_open": [min(frames), max(frames) + 1],
+        }
+        for key, frames in sorted(groups.items())
+    ]
+    expected_target = next(row for row in expected_rows if row["full_frame"] == 342)
+    if expected_target != {
+        "full_frame": 342, "window_id": 5, "local_frame": 70,
+        "latent_t": 18, "patch_t": 18, "token_start": 27144,
+        "token_end": 28652, "token_count": 1508,
+    }:
+        raise RuntimeError("BLOCKED_FIXTURE_SCHEMA: internal canonical target drift")
+    expected_boundaries = [group["full_frame_half_open"] for group in expected_groups]
+    if (
+        len(expected_rows) != 125
+        or len(expected_groups) != 32
+        or mapping.get("target") != expected_target
+        or mapping.get("per_frame") != expected_rows
+        or mapping.get("deduplicated_many_to_one_groups") != expected_groups
+        or mapping.get("group_boundaries") != expected_boundaries
+    ):
+        raise RuntimeError("BLOCKED_FIXTURE_SCHEMA: canonical frame/token mapping drift")
+    return list(memory)
+
+
+def select_unique_train_fixture(frozen: dict[str, Any]) -> tuple[dict[str, Any], list[int]]:
+    fixtures = frozen.get("fixtures")
+    if not isinstance(fixtures, list):
+        raise RuntimeError("BLOCKED_FIXTURE_SCHEMA: fixtures must be a list")
+    train = [
+        item for item in fixtures
+        if isinstance(item, dict) and item.get("role") == "TRAIN"
+    ]
+    if len(train) != 1:
+        raise RuntimeError(
+            f"BLOCKED_FIXTURE_SCHEMA: expected exactly one TRAIN fixture, got {len(train)}"
+        )
+    memory = validate_train_fixture_schema(train[0])
+    return train[0], memory
+
+
+def classify_probe_error(exc: Exception) -> str:
+    message = str(exc)
+    if "BLOCKED_CPU_TESTS" in message:
+        return "BLOCKED_CPU_TESTS"
+    if "BLOCKED_FIXTURE_SCHEMA" in message:
+        return "BLOCKED_FIXTURE_SCHEMA"
+    return "BLOCKED_GPU_RUNTIME"
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -119,7 +261,7 @@ def main() -> int:
         runtime = json.loads((Path(args.fixture_output) / "runtime_contract.json").read_text())
         if frozen.get("status") != "FIXTURE_FREEZE_PASS" or runtime.get("status") != "PASS":
             raise RuntimeError("frozen TRAIN fixture/runtime contract is not PASS")
-        fixture = next(item for item in frozen["fixtures"] if item["role"] == "TRAIN")
+        fixture, selected_memory_frames = select_unique_train_fixture(frozen)
         mapping = fixture["frame_to_token_mapping"]
         device = torch.device(args.device)
         data = _load_case(frozen["cases_root"], fixture["case_id"], int(fixture["total_frames"]))
@@ -151,7 +293,7 @@ def main() -> int:
         token_slice = slice(int(target["token_start"]), int(target["token_end"]))
 
         selected_latents = []
-        for frame_index in fixture["memory_selected_set"]:
+        for frame_index in selected_memory_frames:
             frame = torch.from_numpy(np.ascontiguousarray(data["rgb"][frame_index])).float().unsqueeze(1)
             if frame.shape[-2:] != (spatial.pixel_h, spatial.pixel_w):
                 frame = torch.nn.functional.interpolate(frame.unsqueeze(0), size=(1, spatial.pixel_h, spatial.pixel_w), mode="trilinear", align_corners=False).squeeze(0)
@@ -337,7 +479,7 @@ def main() -> int:
         }
         report.update({
             "status": "A0_GATE_CANDIDATE" if all(gates.values()) else "A0_GATE_NOT_CANDIDATE",
-            "gates": gates, "fixture": {"case_id": fixture["case_id"], "event_id": fixture["event_id"], "window_id": plan.window_index, "memory_frames": fixture["memory_selected_set"], "route_query_tokens": int(route.sum())},
+            "gates": gates, "fixture": {"case_id": fixture["case_id"], "event_id": fixture["event_id"], "window_id": plan.window_index, "memory_frames": selected_memory_frames, "route_query_tokens": int(route.sum())},
             "config": config.canonical_dict(), "config_fingerprint": config.fingerprint(),
             "adapter_state_fingerprint": adapter_fp, "trainable_inventory": adapter.trainable_inventory(),
             "expected_trainable_inventory": expected_inventory,
@@ -358,7 +500,7 @@ def main() -> int:
             "note": "Candidate evidence only; this probe never declares A0 Gate PASS.",
         })
     except Exception as exc:
-        status = "BLOCKED_CPU_TESTS" if "BLOCKED_CPU_TESTS" in str(exc) else "BLOCKED_GPU_RUNTIME"
+        status = classify_probe_error(exc)
         report.update({"status": status, "error": f"{type(exc).__name__}: {exc}", "note": "No PASS inferred. Review and rerun."})
     dump(output / "a0_parity_report.json", report)
     print(json.dumps(report, indent=2, sort_keys=True))
